@@ -24,13 +24,13 @@ import type { IStorageAdapter } from "../storage/adapter.ts";
  */
 export function parseDurationMs(durationStr: string): number {
   const match = /^(\d+)\s*(s|m|h|d)$/i.exec(durationStr.trim());
-  if (!match) {
+  if (!match?.[2]) {
     throw new Error(
       `Định dạng thời gian "${durationStr}" không hợp lệ. Ví dụ hợp lệ: "30m", "24h", "7d".`
     );
   }
   const value = Number(match[1]);
-  const unit = match[2]!.toLowerCase();
+  const unit = match[2].toLowerCase();
   switch (unit) {
     case "s":
       return value * 1000;
@@ -311,7 +311,7 @@ export class KeyManagerService {
     status?: KeyStatus;
   }): Promise<{ record: JwkRecord; diff: MutationDiff }> {
     const trimmed = options.rawContent.trim();
-    let material;
+    let material: Awaited<ReturnType<typeof extractPublicJwkFromPrivatePem>>;
 
     if (trimmed.startsWith("-----BEGIN")) {
       if (!options.alg) {

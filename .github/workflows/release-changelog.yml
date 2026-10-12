@@ -1,0 +1,120 @@
+name: Update Changelog on Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag phiên bản cần thêm vào CHANGELOG.md (ví dụ: v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  changelog:
+    name: Update CHANGELOG.md
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Generate and prepend release entry to CHANGELOG.md
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+          RELEASE_NAME: ${{ github.event.release.name || inputs.tag_name }}
+          RELEASE_BODY: ${{ github.event.release.body || '' }}
+          RELEASE_URL: ${{ github.event.release.html_url || format('https://github.com/{0}/releases/tag/{1}', github.repository, inputs.tag_name) }}
+          PUBLISHED_AT: ${{ github.event.release.published_at || '' }}
+        run: |
+          bun -e '
+            import { existsSync, readFileSync, writeFileSync } from "node:fs";
+            import { execFileSync } from "node:child_process";
+
+            const tag = process.env.RELEASE_TAG?.trim();
+            if (!tag) {
+              console.error("Missing RELEASE_TAG");
+              process.exit(1);
+            }
+
+            const dateStr = process.env.PUBLISHED_AT
+              ? process.env.PUBLISHED_AT.slice(0, 10)
+              : new Date().toISOString().slice(0, 10);
+
+            let body = (process.env.RELEASE_BODY ?? "").trim();
+            if (!body) {
+              try {
+                const prevTag = execFileSync("git", ["describe", "--tags", "--abbrev=0", `${tag}^`], {
+                  encoding: "utf8",
+                  stdio: ["ignore", "pipe", "ignore"],
+                }).trim();
+                body = execFileSync("git", ["log", `${prevTag}..${tag}`, "--pretty=format:- %s (%h)", "--no-merges"], {
+                  encoding: "utf8",
+                }).trim();
+              } catch {
+                try {
+                  body = execFileSync("git", ["log", tag, "--pretty=format:- %s (%h)", "--no-merges"], {
+                    encoding: "utf8",
+                  }).trim();
+                } catch {
+                  body = "- Phát hành phiên bản mới.";
+                }
+              }
+            }
+
+            const changelogPath = "CHANGELOG.md";
+            const defaultHeader = "# Changelog\n\nMọi thay đổi đáng chú ý của dự án `jwksctl` sẽ được ghi nhận tại file này.\n";
+            const current = existsSync(changelogPath)
+              ? readFileSync(changelogPath, "utf8")
+              : defaultHeader;
+
+            if (current.includes(`## [${tag}]`)) {
+              console.log(`Tag ${tag} đã tồn tại trong CHANGELOG.md, bỏ qua.`);
+              process.exit(0);
+            }
+
+            const releaseUrl = process.env.RELEASE_URL?.trim();
+            const heading = releaseUrl
+              ? `## [${tag}](${releaseUrl}) - ${dateStr}`
+              : `## [${tag}] - ${dateStr}`;
+
+            const entry = `\n${heading}\n\n${body || "- Phát hành phiên bản mới."}\n`;
+            const lines = current.split("\n");
+            const firstSectionIdx = lines.findIndex((line) => line.startsWith("## "));
+
+            let updated: string;
+            if (firstSectionIdx === -1) {
+              updated = `${current.trimEnd()}\n${entry}`;
+            } else {
+              const before = lines.slice(0, firstSectionIdx).join("\n").trimEnd();
+              const after = lines.slice(firstSectionIdx).join("\n");
+              updated = `${before}\n${entry}\n${after}`;
+            }
+
+            writeFileSync(changelogPath, updated, "utf8");
+            console.log(`Đã cập nhật ${tag} vào CHANGELOG.md`);
+          '
+
+      - name: Commit and push CHANGELOG.md
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet CHANGELOG.md; then
+            echo "Không có thay đổi nào trong CHANGELOG.md."
+            exit 0
+          fi
+          git add CHANGELOG.md
+          git commit -m "chore(release): cập nhật CHANGELOG.md cho bản phát hành ${RELEASE_TAG} [skip ci]"
+          git push origin HEAD:main

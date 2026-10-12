@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
     "@types/bun": "latest"
   },
   "peerDependencies": {
@@ -14,5 +15,10 @@
     "commander": "^15.0.0",
     "jose": "^6.2.12",
     "picocolors": "^1.1.1"
+  },
+  "scripts": {
+    "lint": "biome lint --error-on-warnings src tests index.ts",
+    "lint:fix": "biome check --write src tests index.ts",
+    "typecheck": "tsc --noEmit"
   }
 }
