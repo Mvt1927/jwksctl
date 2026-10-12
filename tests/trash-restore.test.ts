@@ -155,4 +155,95 @@ describe("Trash Bin (.trash) & Full Restore (JWK + .pem)", () => {
 		expect(bakRestore.mode).toBe("bak");
 		expect(await Bun.file(pem1Path).exists()).toBe(true);
 	});
+
+	test("3. Mặc định jwks.json, keys/ và .trash/ luôn cố định tại thư mục cài đặt jwksctl dù đứng ở thư mục làm việc khác", async () => {
+		const {
+			DEFAULT_KEYS_DIR,
+			DEFAULT_STORE_URI,
+			DEFAULT_TRASH_DIR,
+			INSTALL_DIR,
+			resolveRuntimeContext,
+		} = await import("../src/config/loader.ts");
+
+		const origCwd = process.cwd();
+		try {
+			// Giả lập người dùng cd sang một thư mục dự án khác (tempDir)
+			process.chdir(tempDir);
+
+			const ctx = await resolveRuntimeContext({
+				configPath: join(tempDir, "non-existent-config.json"),
+			});
+			const vault = new PemVault(ctx.profile.keysDir);
+
+			expect(DEFAULT_STORE_URI).toBe(join(INSTALL_DIR, "jwks.json"));
+			expect(DEFAULT_KEYS_DIR).toBe(join(INSTALL_DIR, "keys"));
+			expect(DEFAULT_TRASH_DIR).toBe(join(INSTALL_DIR, ".trash"));
+			expect(vault.trashDir).toBe(join(INSTALL_DIR, ".trash"));
+		} finally {
+			process.chdir(origCwd);
+		}
+	});
+
+	test("4. Khi export ra file jwks.json đã tồn tại: Phát hiện file, lập Bảng Merge và cho phép chọn khóa Giữ / Bỏ", async () => {
+		const storeFile = join(tempDir, "master-jwks.json");
+		const keysDir = join(tempDir, "keys");
+		const cfgFile = join(tempDir, ".jwksctl.json");
+		const projectDir = join(tempDir, "my-app");
+		const targetExportFile = join(projectDir, "jwks.json");
+		const baseFlags = ["--store", storeFile, "--keys-dir", keysDir, "--config", cfgFile, "--json"];
+
+		await runCli([...baseFlags, "init"]);
+		// Tạo 2 khóa ban đầu và xuất ra file targetExportFile lần 1
+		await runCli([...baseFlags, "generate", "--alg", "EdDSA", "--kid", "legacy-k1"]);
+		await runCli([...baseFlags, "generate", "--alg", "ES256", "--kid", "shared-k2"]);
+
+		const firstExport = JSON.parse(
+			(await runCli([...baseFlags, "export", "-o", targetExportFile])).stdout,
+		);
+		expect(firstExport.targetFileExistsBefore).toBe(false);
+		expect(firstExport.keptCount).toBe(2);
+
+		// Xóa legacy-k1 khỏi Store và tạo thêm khóa mới new-k3 trong Store
+		await runCli([...baseFlags, "remove", "legacy-k1", "--force", "--yes"]);
+		await runCli([...baseFlags, "generate", "--alg", "RS256", "--kid", "new-k3"]);
+
+		// Lúc này:
+		// - File đích (targetExportFile) đang có: ["legacy-k1", "shared-k2"]
+		// - Store đang có: ["shared-k2", "new-k3"]
+		// Khi chạy export lần 2 kèm --drop legacy-k1:
+		const secondExport = JSON.parse(
+			(
+				await runCli([
+					...baseFlags,
+					"export",
+					"-o",
+					targetExportFile,
+					"--drop",
+					"legacy-k1",
+					"--yes",
+				])
+			).stdout,
+		);
+
+		expect(secondExport.targetFileExistsBefore).toBe(true);
+		expect(
+			secondExport.candidates.map((c: { kid: string; source: string }) => ({
+				kid: c.kid,
+				source: c.source,
+			})),
+		).toEqual([
+			{ kid: "legacy-k1", source: "existing_only" },
+			{ kid: "shared-k2", source: "both" },
+			{ kid: "new-k3", source: "new_from_store" },
+		]);
+		expect(secondExport.keptCount).toBe(2);
+		expect(secondExport.droppedCount).toBe(1);
+		expect(secondExport.droppedKids).toEqual(["legacy-k1"]);
+
+		const finalExportedJson = JSON.parse(await Bun.file(targetExportFile).text());
+		expect(finalExportedJson.keys.map((k: { kid: string }) => k.kid)).toEqual([
+			"shared-k2",
+			"new-k3",
+		]);
+	});
 });

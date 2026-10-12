@@ -63,7 +63,7 @@ export function sanitizePublicJwk(
 /**
  * Chuyển đổi JwkRecord nội bộ sang PublicJwk thuần RFC 7517 (dùng cho export và /.well-known/jwks.json).
  */
-export function toCleanPublicJwk(record: JwkRecord): PublicJwk {
+export function toCleanPublicJwk(record: JwkRecord | PublicJwk): PublicJwk {
 	return sanitizePublicJwk(record, {
 		kid: record.kid,
 		alg: record.alg,

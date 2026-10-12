@@ -1,3 +1,5 @@
+import { mkdir, rename } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { decodeProtectedHeader, type JWK, type JWTPayload } from "jose";
 import {
 	exportPublicJwkToPem,
@@ -14,6 +16,7 @@ import type {
 	JwkRecord,
 	KeyStatus,
 	MutationDiff,
+	PublicJwk,
 	PublicJwksPayload,
 	SigningAlgorithm,
 	TrashItem,
@@ -84,6 +87,22 @@ export interface IntegrityCheckReport {
 	revokedKeys: number;
 	expiredPassiveKeys: string[];
 	missingPrivateKeyFiles: Array<{ kid: string; path: string }>;
+}
+
+export type ExportMergeSource = "new_from_store" | "both" | "existing_only";
+
+export interface ExportMergeCandidate {
+	kid: string;
+	jwk: PublicJwk;
+	source: ExportMergeSource;
+	storeStatus?: KeyStatus;
+}
+
+export interface ExportMergePlan {
+	targetFileExists: boolean;
+	existingCount: number;
+	storeCount: number;
+	candidates: ExportMergeCandidate[];
 }
 
 export class KeyManagerService {
@@ -393,6 +412,139 @@ export class KeyManagerService {
 
 		return {
 			keys: eligible.map((rec) => toCleanPublicJwk(rec)),
+		};
+	}
+
+	/**
+	 * Kiểm tra file đích khi export: nếu file đã tồn tại, lập danh sách đối chiếu Merge
+	 * giữa các khóa đang có sẵn trong file đích và các khóa từ jwksctl Store.
+	 */
+	async prepareExportMergePlan(
+		targetFilePath: string,
+		options: { includePassive?: boolean; now?: Date } = {},
+	): Promise<ExportMergePlan> {
+		const absPath = resolve(targetFilePath);
+		const storePayload = await this.exportPublicJwks(options);
+		const allStoreRecords = await this.adapter.listKeys();
+		const statusMap = new Map<string, KeyStatus>(allStoreRecords.map((r) => [r.kid, r.status]));
+		const storeKeyMap = new Map<string, PublicJwk>(storePayload.keys.map((k) => [k.kid, k]));
+
+		const file = Bun.file(absPath);
+		const targetFileExists = await file.exists();
+
+		if (!targetFileExists) {
+			return {
+				targetFileExists: false,
+				existingCount: 0,
+				storeCount: storePayload.keys.length,
+				candidates: storePayload.keys.map((k) => ({
+					kid: k.kid,
+					jwk: k,
+					source: "new_from_store",
+					storeStatus: statusMap.get(k.kid),
+				})),
+			};
+		}
+
+		let existingKeys: PublicJwk[] = [];
+		try {
+			const rawText = (await file.text()).trim();
+			if (rawText.length > 0) {
+				const parsed = JSON.parse(rawText) as { keys?: unknown[] };
+				if (Array.isArray(parsed.keys)) {
+					existingKeys = parsed.keys
+						.filter(
+							(item): item is Record<string, unknown> =>
+								typeof item === "object" &&
+								item !== null &&
+								typeof (item as { kid?: unknown }).kid === "string",
+						)
+						.map((item) => toCleanPublicJwk(item as unknown as PublicJwk));
+				}
+			}
+		} catch {
+			existingKeys = [];
+		}
+
+		const existingKeyMap = new Map<string, PublicJwk>(existingKeys.map((k) => [k.kid, k]));
+		const candidates: ExportMergeCandidate[] = [];
+
+		// 1. Duyệt các khóa đang có trong file đích trước
+		for (const existingKey of existingKeys) {
+			const fromStore = storeKeyMap.get(existingKey.kid);
+			if (fromStore) {
+				candidates.push({
+					kid: existingKey.kid,
+					jwk: fromStore,
+					source: "both",
+					storeStatus: statusMap.get(existingKey.kid),
+				});
+			} else {
+				candidates.push({
+					kid: existingKey.kid,
+					jwk: existingKey,
+					source: "existing_only",
+				});
+			}
+		}
+
+		// 2. Duyệt các khóa mới từ Store chưa có trong file đích
+		for (const storeKey of storePayload.keys) {
+			if (!existingKeyMap.has(storeKey.kid)) {
+				candidates.push({
+					kid: storeKey.kid,
+					jwk: storeKey,
+					source: "new_from_store",
+					storeStatus: statusMap.get(storeKey.kid),
+				});
+			}
+		}
+
+		return {
+			targetFileExists: true,
+			existingCount: existingKeys.length,
+			storeCount: storePayload.keys.length,
+			candidates,
+		};
+	}
+
+	/**
+	 * Ghi nguyên tử (Atomic Write) các khóa đã chọn (Giữ lại) ra file Public JWKS đích.
+	 */
+	async writeExportedJwksFile(
+		targetFilePath: string,
+		selectedKids: readonly string[],
+		plan: ExportMergePlan,
+	): Promise<{
+		writtenKeys: PublicJwk[];
+		keptCount: number;
+		droppedCount: number;
+		droppedKids: string[];
+	}> {
+		const absPath = resolve(targetFilePath);
+		const selectedSet = new Set(selectedKids);
+		const writtenKeys: PublicJwk[] = [];
+		const droppedKids: string[] = [];
+
+		for (const candidate of plan.candidates) {
+			if (selectedSet.has(candidate.kid)) {
+				writtenKeys.push(toCleanPublicJwk(candidate.jwk));
+			} else {
+				droppedKids.push(candidate.kid);
+			}
+		}
+
+		await mkdir(dirname(absPath), { recursive: true });
+		const payload: PublicJwksPayload = { keys: writtenKeys };
+		const tmpPath = `${absPath}.tmp.${process.pid}.${Date.now()}`;
+		await Bun.write(tmpPath, `${JSON.stringify(payload, null, 2)}\n`);
+		await rename(tmpPath, absPath);
+
+		return {
+			writtenKeys,
+			keptCount: writtenKeys.length,
+			droppedCount: droppedKids.length,
+			droppedKids,
 		};
 	}
 

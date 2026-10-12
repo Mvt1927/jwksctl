@@ -1,5 +1,5 @@
 import { copyFile, mkdir, rename, rm, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { JwkRecord, TrashItem } from "./types.ts";
 
 const ENCRYPTED_HEADER = "-----BEGIN ENCRYPTED JWKSCTL PRIVATE KEY-----";
@@ -106,12 +106,28 @@ export async function decryptPemContent(content: string, passphrase?: string): P
 }
 
 export class PemVault {
+	readonly vaultRootDir: string;
 	readonly trashDir: string;
 	readonly trashManifestPath: string;
 
-	constructor(private readonly baseKeysDir: string = "./keys") {
-		this.trashDir = join(this.baseKeysDir, ".trash");
+	constructor(
+		private readonly baseKeysDir: string = "./keys",
+		customTrashDir?: string,
+	) {
+		this.vaultRootDir = dirname(resolve(this.baseKeysDir));
+		this.trashDir = customTrashDir ? resolve(customTrashDir) : join(this.vaultRootDir, ".trash");
 		this.trashManifestPath = resolve(join(this.trashDir, "manifest.json"));
+	}
+
+	/**
+	 * Phân giải đường dẫn file .pem tương đối dựa trên thư mục gốc cài đặt (vaultRootDir)
+	 * để chạy từ bất kỳ thư mục nào cũng tìm đúng file .pem.
+	 */
+	resolveKeyPath(filePath: string): string {
+		if (isAbsolute(filePath)) {
+			return resolve(filePath);
+		}
+		return resolve(this.vaultRootDir, filePath);
 	}
 
 	getKeyFilePath(kid: string): string {
@@ -130,7 +146,7 @@ export class PemVault {
 		passphrase?: string,
 	): Promise<{ privateKeyPath: string; isEncrypted: boolean }> {
 		const filePath = this.getKeyFilePath(kid);
-		const absPath = resolve(filePath);
+		const absPath = this.resolveKeyPath(filePath);
 		await mkdir(dirname(absPath), { recursive: true });
 
 		const isEncrypted = Boolean(passphrase && passphrase.length > 0);
@@ -151,7 +167,7 @@ export class PemVault {
 	}
 
 	async loadPrivateKey(privateKeyPath: string, passphrase?: string): Promise<string> {
-		const absPath = resolve(privateKeyPath);
+		const absPath = this.resolveKeyPath(privateKeyPath);
 		const file = Bun.file(absPath);
 		if (!(await file.exists())) {
 			throw new Error(`Không tìm thấy file Private Key tại đường dẫn: ${privateKeyPath}`);
@@ -162,7 +178,7 @@ export class PemVault {
 
 	async exists(privateKeyPath: string): Promise<boolean> {
 		try {
-			const info = await stat(resolve(privateKeyPath));
+			const info = await stat(this.resolveKeyPath(privateKeyPath));
 			return info.isFile();
 		} catch {
 			return false;
@@ -170,7 +186,7 @@ export class PemVault {
 	}
 
 	async deletePrivateKey(privateKeyPath: string): Promise<boolean> {
-		const absPath = resolve(privateKeyPath);
+		const absPath = this.resolveKeyPath(privateKeyPath);
 		if (!(await this.exists(absPath))) {
 			return false;
 		}
@@ -199,16 +215,16 @@ export class PemVault {
 	}
 
 	/**
-	 * Đưa khóa và file Private Key (.pem) vào Thùng rác (.trash) thay vì xóa vĩnh viễn.
+	 * Đưa khóa và file Private Key (.pem) vào Thùng rác (.trash) tại thư mục cài đặt jwksctl thay vì xóa vĩnh viễn.
 	 */
 	async moveToTrash(record: JwkRecord): Promise<TrashItem> {
 		await mkdir(resolve(this.trashDir), { recursive: true });
-		const srcAbs = resolve(record.privateKeyPath);
+		const srcAbs = this.resolveKeyPath(record.privateKeyPath);
 		let trashPemPath: string | null = null;
 
 		if (await this.exists(srcAbs)) {
 			const relTrashPem = this.getTrashPemPath(record.kid).replace(/\\/g, "/");
-			const destAbs = resolve(relTrashPem);
+			const destAbs = this.resolveKeyPath(relTrashPem);
 			await copyFile(srcAbs, destAbs);
 			await rm(srcAbs, { force: true });
 			trashPemPath = relTrashPem;
@@ -243,10 +259,11 @@ export class PemVault {
 		}
 
 		if (found.trashPemPath && (await this.exists(found.trashPemPath))) {
-			const destAbs = resolve(found.record.privateKeyPath);
+			const srcTrashAbs = this.resolveKeyPath(found.trashPemPath);
+			const destAbs = this.resolveKeyPath(found.record.privateKeyPath);
 			await mkdir(dirname(destAbs), { recursive: true });
-			await copyFile(resolve(found.trashPemPath), destAbs);
-			await rm(resolve(found.trashPemPath), { force: true });
+			await copyFile(srcTrashAbs, destAbs);
+			await rm(srcTrashAbs, { force: true });
 		}
 
 		const remaining = current.filter((x) => x.record.kid !== kid);
@@ -272,15 +289,16 @@ export class PemVault {
 				trashItem?.trashPemPath &&
 				(await this.exists(trashItem.trashPemPath))
 			) {
-				const destAbs = resolve(rec.privateKeyPath);
+				const srcTrashAbs = this.resolveKeyPath(trashItem.trashPemPath);
+				const destAbs = this.resolveKeyPath(rec.privateKeyPath);
 				await mkdir(dirname(destAbs), { recursive: true });
-				await copyFile(resolve(trashItem.trashPemPath), destAbs);
-				await rm(resolve(trashItem.trashPemPath), { force: true });
+				await copyFile(srcTrashAbs, destAbs);
+				await rm(srcTrashAbs, { force: true });
 				restoredPems.push(rec.privateKeyPath);
 				restoredKids.add(rec.kid);
 			} else if (alreadyExists && trashItem) {
 				if (trashItem.trashPemPath && (await this.exists(trashItem.trashPemPath))) {
-					await rm(resolve(trashItem.trashPemPath), { force: true });
+					await rm(this.resolveKeyPath(trashItem.trashPemPath), { force: true });
 				}
 				restoredKids.add(rec.kid);
 			}
@@ -307,7 +325,7 @@ export class PemVault {
 
 		for (const item of toDelete) {
 			if (item.trashPemPath && (await this.exists(item.trashPemPath))) {
-				await rm(resolve(item.trashPemPath), { force: true });
+				await rm(this.resolveKeyPath(item.trashPemPath), { force: true });
 			}
 		}
 
