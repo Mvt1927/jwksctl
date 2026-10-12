@@ -1,5 +1,6 @@
-import { mkdir, rename, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import type { JwkRecord, TrashItem } from "./types.ts";
 
 const ENCRYPTED_HEADER = "-----BEGIN ENCRYPTED JWKSCTL PRIVATE KEY-----";
 const ENCRYPTED_FOOTER = "-----END ENCRYPTED JWKSCTL PRIVATE KEY-----";
@@ -13,6 +14,10 @@ interface EncryptedPayload {
 	salt: string;
 	iv: string;
 	ciphertext: string;
+}
+
+interface TrashManifest {
+	items: TrashItem[];
 }
 
 async function deriveAesKey(passphrase: string, salt: Uint8Array): Promise<CryptoKey> {
@@ -101,11 +106,22 @@ export async function decryptPemContent(content: string, passphrase?: string): P
 }
 
 export class PemVault {
-	constructor(private readonly baseKeysDir: string = "./keys") {}
+	readonly trashDir: string;
+	readonly trashManifestPath: string;
+
+	constructor(private readonly baseKeysDir: string = "./keys") {
+		this.trashDir = join(this.baseKeysDir, ".trash");
+		this.trashManifestPath = resolve(join(this.trashDir, "manifest.json"));
+	}
 
 	getKeyFilePath(kid: string): string {
 		const safeKid = kid.replace(/[^a-zA-Z0-9._-]/g, "_");
 		return join(this.baseKeysDir, `${safeKid}.pem`);
+	}
+
+	getTrashPemPath(kid: string): string {
+		const safeKid = kid.replace(/[^a-zA-Z0-9._-]/g, "_");
+		return join(this.trashDir, `${safeKid}.pem`);
 	}
 
 	async savePrivateKey(
@@ -118,12 +134,11 @@ export class PemVault {
 		await mkdir(dirname(absPath), { recursive: true });
 
 		const isEncrypted = Boolean(passphrase && passphrase.length > 0);
-		const contentToWrite =
-			passphrase && passphrase.length > 0
-				? await encryptPemContent(pkcs8Pem, passphrase)
-				: pkcs8Pem.endsWith("\n")
-					? pkcs8Pem
-					: `${pkcs8Pem}\n`;
+		const contentToWrite = isEncrypted
+			? await encryptPemContent(pkcs8Pem, passphrase!)
+			: pkcs8Pem.endsWith("\n")
+				? pkcs8Pem
+				: `${pkcs8Pem}\n`;
 
 		const tmpPath = `${absPath}.tmp.${process.pid}.${Date.now()}`;
 		await Bun.write(tmpPath, contentToWrite);
@@ -161,5 +176,142 @@ export class PemVault {
 		}
 		await rm(absPath, { force: true });
 		return true;
+	}
+
+	private async readTrashManifest(): Promise<TrashItem[]> {
+		const file = Bun.file(this.trashManifestPath);
+		if (!(await file.exists())) {
+			return [];
+		}
+		try {
+			const parsed = JSON.parse(await file.text()) as TrashManifest;
+			return Array.isArray(parsed.items) ? parsed.items : [];
+		} catch {
+			return [];
+		}
+	}
+
+	private async writeTrashManifest(items: TrashItem[]): Promise<void> {
+		await mkdir(resolve(this.trashDir), { recursive: true });
+		const tmpPath = `${this.trashManifestPath}.tmp.${process.pid}.${Date.now()}`;
+		await Bun.write(tmpPath, `${JSON.stringify({ items }, null, 2)}\n`);
+		await rename(tmpPath, this.trashManifestPath);
+	}
+
+	/**
+	 * Đưa khóa và file Private Key (.pem) vào Thùng rác (.trash) thay vì xóa vĩnh viễn.
+	 */
+	async moveToTrash(record: JwkRecord): Promise<TrashItem> {
+		await mkdir(resolve(this.trashDir), { recursive: true });
+		const srcAbs = resolve(record.privateKeyPath);
+		let trashPemPath: string | null = null;
+
+		if (await this.exists(srcAbs)) {
+			const relTrashPem = this.getTrashPemPath(record.kid).replace(/\\/g, "/");
+			const destAbs = resolve(relTrashPem);
+			await copyFile(srcAbs, destAbs);
+			await rm(srcAbs, { force: true });
+			trashPemPath = relTrashPem;
+		}
+
+		const item: TrashItem = {
+			record,
+			deletedAt: new Date().toISOString(),
+			trashPemPath,
+		};
+
+		const current = await this.readTrashManifest();
+		const filtered = current.filter((x) => x.record.kid !== record.kid);
+		filtered.push(item);
+		await this.writeTrashManifest(filtered);
+
+		return item;
+	}
+
+	async listTrash(): Promise<TrashItem[]> {
+		return this.readTrashManifest();
+	}
+
+	/**
+	 * Khôi phục file .pem và bản ghi JwkRecord từ Thùng rác về lại vị trí gốc.
+	 */
+	async restoreFromTrash(kid: string): Promise<TrashItem> {
+		const current = await this.readTrashManifest();
+		const found = current.find((x) => x.record.kid === kid);
+		if (!found) {
+			throw new Error(`Không tìm thấy khóa "${kid}" trong Thùng rác (${this.trashDir}).`);
+		}
+
+		if (found.trashPemPath && (await this.exists(found.trashPemPath))) {
+			const destAbs = resolve(found.record.privateKeyPath);
+			await mkdir(dirname(destAbs), { recursive: true });
+			await copyFile(resolve(found.trashPemPath), destAbs);
+			await rm(resolve(found.trashPemPath), { force: true });
+		}
+
+		const remaining = current.filter((x) => x.record.kid !== kid);
+		await this.writeTrashManifest(remaining);
+		return found;
+	}
+
+	/**
+	 * Tự động khôi phục các file .pem đang nằm trong Thùng rác cho danh sách bản ghi (dùng khi restore từ .bak).
+	 */
+	async restoreMissingPemsForRecords(records: readonly JwkRecord[]): Promise<string[]> {
+		const current = await this.readTrashManifest();
+		const trashMap = new Map(current.map((item) => [item.record.kid, item]));
+		const restoredPems: string[] = [];
+		const restoredKids = new Set<string>();
+
+		for (const rec of records) {
+			const alreadyExists = await this.exists(rec.privateKeyPath);
+			const trashItem = trashMap.get(rec.kid);
+
+			if (
+				!alreadyExists &&
+				trashItem?.trashPemPath &&
+				(await this.exists(trashItem.trashPemPath))
+			) {
+				const destAbs = resolve(rec.privateKeyPath);
+				await mkdir(dirname(destAbs), { recursive: true });
+				await copyFile(resolve(trashItem.trashPemPath), destAbs);
+				await rm(resolve(trashItem.trashPemPath), { force: true });
+				restoredPems.push(rec.privateKeyPath);
+				restoredKids.add(rec.kid);
+			} else if (alreadyExists && trashItem) {
+				if (trashItem.trashPemPath && (await this.exists(trashItem.trashPemPath))) {
+					await rm(resolve(trashItem.trashPemPath), { force: true });
+				}
+				restoredKids.add(rec.kid);
+			}
+		}
+
+		if (restoredKids.size > 0) {
+			const remaining = current.filter((x) => !restoredKids.has(x.record.kid));
+			await this.writeTrashManifest(remaining);
+		}
+
+		return restoredPems;
+	}
+
+	/**
+	 * Dọn sạch vĩnh viễn Thùng rác (toàn bộ hoặc theo danh sách kid).
+	 */
+	async emptyTrash(kids?: readonly string[]): Promise<number> {
+		const current = await this.readTrashManifest();
+		if (current.length === 0) return 0;
+
+		const targetSet = kids && kids.length > 0 ? new Set(kids) : null;
+		const toDelete = targetSet ? current.filter((x) => targetSet.has(x.record.kid)) : current;
+		const toKeep = targetSet ? current.filter((x) => !targetSet.has(x.record.kid)) : [];
+
+		for (const item of toDelete) {
+			if (item.trashPemPath && (await this.exists(item.trashPemPath))) {
+				await rm(resolve(item.trashPemPath), { force: true });
+			}
+		}
+
+		await this.writeTrashManifest(toKeep);
+		return toDelete.length;
 	}
 }

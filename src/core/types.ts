@@ -51,6 +51,12 @@ export interface JwkRecord extends PublicJwk {
 	rotatedAt: string | null;
 }
 
+export interface TrashItem {
+	record: JwkRecord;
+	deletedAt: string;
+	trashPemPath: string | null;
+}
+
 export interface JwksFilePayload {
 	keys: JwkRecord[];
 }
