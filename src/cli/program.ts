@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import pc from "picocolors";
+import packageJson from "../../package.json";
 import {
 	createStorageAdapter,
 	DEFAULT_CONFIG_FILE,
@@ -83,7 +84,7 @@ export function buildCliProgram(): Command {
 		.description(
 			"Công cụ CLI quản lý vòng đời JWKS (File JSON & Database) an toàn, tách biệt Public JWK và Private Key (.pem)",
 		)
-		.version("1.0.0")
+		.version(packageJson.version, "-v, --version", "Hiển thị phiên bản hiện tại của jwksctl")
 		.option("-s, --store <uri>", "Đường dẫn file jwks.json, file SQLite hoặc Database URI")
 		.option("-p, --profile <name>", "Tên profile cấu hình trong .jwksctl.json")
 		.option("-k, --keys-dir <dir>", "Thư mục lưu trữ các file Private Key (.pem)")
