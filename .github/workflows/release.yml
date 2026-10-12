@@ -1,0 +1,57 @@
+name: Release & Publish Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    name: Build & Release Standalone Binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run Tests
+        run: bun test
+
+      - name: Build Standalone Binaries
+        run: |
+          mkdir -p dist
+          bun run build:linux-x64
+          bun run build:linux-arm64
+          bun run build:windows-x64
+          bun run build:darwin-x64
+          bun run build:darwin-arm64
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum jwksctl-* > SHA256SUMS.txt
+          cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/jwksctl-linux-x64
+            dist/jwksctl-linux-arm64
+            dist/jwksctl-windows-x64.exe
+            dist/jwksctl-darwin-x64
+            dist/jwksctl-darwin-arm64
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
