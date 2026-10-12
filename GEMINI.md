@@ -5,7 +5,8 @@
 3. Luôn tạo plan khi thực hiện các tác vụ trừ những tác vụ nhỏ.
 4. Khi sử dụng skill hãy đưa ra tên skill đã sử dụng.
 5. **Quy tắc Quản lý Nhánh (Git Branching)**:
-   - Mỗi task thực hiện bắt buộc phải tách 1 nhánh Git mới (ví dụ: `feat/<ten-task>`, `fix/<ten-task>`, `chore/<ten-task>`).
-   - Nếu trong quá trình thực hiện task có sử dụng **subagent**, subagent đó bắt buộc phải tách nhánh mới xuất phát từ nhánh của task vừa tạo đó (sử dụng `Workspace: "branch"` từ nhánh hiện tại hoặc checkout nhánh con `feat/<ten-task>-<subagent>`).
+   - Mỗi task thực hiện bắt buộc phải tách 1 nhánh Git mới từ `main` (ví dụ: `feat/<ten-task>`, `fix/<ten-task>`, `chore/<ten-task>`).
+   - Nếu trong quá trình thực hiện task có sử dụng **subagent**, subagent đó bắt buộc phải tách nhánh mới xuất phát từ nhánh của task vừa tạo đó (sử dụng `Workspace: "branch"` từ nhánh hiện tại hoặc checkout nhánh con `feat/<ten-task>-<subagent>`), sau khi subagent xong thì merge vào nhánh của task.
+   - Sau khi hoàn thành mỗi task, bắt buộc phải **merge nhánh task vào `main` và `git push origin main`**.
 6. **Quy tắc Khởi tạo & Quản lý Gói**:
    - Luôn sử dụng CLI chính thức (`bun init`, `bun add`...) để khởi tạo dự án và cài đặt thư viện; tuyệt đối không viết tay `package.json` hay tự điền version thủ công để tránh dùng phải version cũ.
