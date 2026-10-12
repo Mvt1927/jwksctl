@@ -122,11 +122,12 @@ export class PemVault {
     await mkdir(dirname(absPath), { recursive: true });
 
     const isEncrypted = Boolean(passphrase && passphrase.length > 0);
-    const contentToWrite = isEncrypted
-      ? await encryptPemContent(pkcs8Pem, passphrase!)
-      : pkcs8Pem.endsWith("\n")
-        ? pkcs8Pem
-        : `${pkcs8Pem}\n`;
+    const contentToWrite =
+      passphrase && passphrase.length > 0
+        ? await encryptPemContent(pkcs8Pem, passphrase)
+        : pkcs8Pem.endsWith("\n")
+          ? pkcs8Pem
+          : `${pkcs8Pem}\n`;
 
     const tmpPath = `${absPath}.tmp.${process.pid}.${Date.now()}`;
     await Bun.write(tmpPath, contentToWrite);

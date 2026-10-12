@@ -82,8 +82,8 @@ export class SafeMutationGuard {
     after: readonly JwkRecord[],
     expectedAddedKids: readonly string[]
   ): void {
-    this.assertNoPrivateMaterial(after);
-    this.assertUniqueKids(after);
+    SafeMutationGuard.assertNoPrivateMaterial(after);
+    SafeMutationGuard.assertUniqueKids(after);
 
     const beforeMap = new Map(before.map((k) => [k.kid, k]));
     const afterMap = new Map(after.map((k) => [k.kid, k]));
@@ -128,8 +128,8 @@ export class SafeMutationGuard {
     after: readonly JwkRecord[],
     targetKids: readonly string[]
   ): void {
-    this.assertNoPrivateMaterial(after);
-    this.assertUniqueKids(after);
+    SafeMutationGuard.assertNoPrivateMaterial(after);
+    SafeMutationGuard.assertUniqueKids(after);
 
     if (before.length !== after.length) {
       throw new IntegrityViolationError(
@@ -169,8 +169,8 @@ export class SafeMutationGuard {
     targetKidsToDelete: readonly string[],
     options: { force?: boolean } = {}
   ): void {
-    this.assertNoPrivateMaterial(after);
-    this.assertUniqueKids(after);
+    SafeMutationGuard.assertNoPrivateMaterial(after);
+    SafeMutationGuard.assertUniqueKids(after);
 
     const targetSet = new Set(targetKidsToDelete);
     if (targetSet.size === 0) {
