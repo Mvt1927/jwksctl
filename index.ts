@@ -7,28 +7,28 @@ import { KeyManagerService } from "./src/core/key-manager.ts";
 import { PemVault } from "./src/core/pem-vault.ts";
 
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
+	const args = process.argv.slice(2);
 
-  // Nếu người dùng gõ `jwksctl` không kèm đối số trên terminal tương tác -> tự bật Interactive Wizard
-  if (args.length === 0 && process.stdin.isTTY) {
-    const ctx = await resolveRuntimeContext();
-    const adapter = createStorageAdapter(ctx.profile);
-    const vault = new PemVault(ctx.profile.keysDir);
-    const manager = new KeyManagerService(adapter, vault);
-    try {
-      await runInteractiveWizard(manager, ctx.passphrase);
-    } finally {
-      await adapter.close?.();
-    }
-    return;
-  }
+	// Nếu người dùng gõ `jwksctl` không kèm đối số trên terminal tương tác -> tự bật Interactive Wizard
+	if (args.length === 0 && process.stdin.isTTY) {
+		const ctx = await resolveRuntimeContext();
+		const adapter = createStorageAdapter(ctx.profile);
+		const vault = new PemVault(ctx.profile.keysDir);
+		const manager = new KeyManagerService(adapter, vault);
+		try {
+			await runInteractiveWizard(manager, ctx.passphrase);
+		} finally {
+			await adapter.close?.();
+		}
+		return;
+	}
 
-  const program = buildCliProgram();
-  await program.parseAsync(process.argv);
+	const program = buildCliProgram();
+	await program.parseAsync(process.argv);
 }
 
 main().catch((err: unknown) => {
-  const message = err instanceof Error ? err.message : String(err);
-  console.error(`${pc.red(pc.bold("✗ Lỗi:"))} ${message}`);
-  process.exit(1);
+	const message = err instanceof Error ? err.message : String(err);
+	console.error(`${pc.red(pc.bold("✗ Lỗi:"))} ${message}`);
+	process.exit(1);
 });

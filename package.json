@@ -1,34 +1,49 @@
 {
-  "name": "jwksctl",
-  "version": "1.0.0",
-  "module": "index.ts",
-  "type": "module",
-  "bin": {
-    "jwksctl": "./index.ts"
-  },
-  "scripts": {
-    "start": "bun run index.ts",
-    "test": "bun test",
-    "typecheck": "bun x tsc --noEmit",
-    "build": "bun build ./index.ts --compile --outfile dist/jwksctl"
-  },
-  "private": true,
-  "devDependencies": {
-    "@biomejs/biome": "^2.5.15",
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  },
-  "dependencies": {
-    "@clack/prompts": "^1.8.1",
-    "commander": "^15.0.0",
-    "jose": "^6.2.12",
-    "picocolors": "^1.1.1"
-  },
-  "scripts": {
-    "lint": "biome lint --error-on-warnings src tests index.ts",
-    "lint:fix": "biome check --write src tests index.ts",
-    "typecheck": "tsc --noEmit"
-  }
+	"name": "jwksctl",
+	"version": "1.0.0",
+	"module": "index.ts",
+	"type": "module",
+	"bin": {
+		"jwksctl": "./index.ts"
+	},
+	"scripts": {
+		"start": "bun run index.ts",
+		"test": "bun test",
+		"typecheck": "tsc --noEmit",
+		"build": "bun build ./index.ts --compile --outfile dist/jwksctl",
+		"lint": "eslint --max-warnings=0 src tests index.ts",
+		"lint:fix": "eslint --fix src tests index.ts && prettier --write .",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"prepare": "husky"
+	},
+	"private": true,
+	"devDependencies": {
+		"@eslint/js": "^10.0.1",
+		"@types/bun": "latest",
+		"eslint": "^10.12.0",
+		"eslint-config-prettier": "^10.1.8",
+		"husky": "^9.1.7",
+		"lint-staged": "^17.6.0",
+		"prettier": "^3.9.10",
+		"typescript-eslint": "^8.71.1"
+	},
+	"peerDependencies": {
+		"typescript": "^5"
+	},
+	"dependencies": {
+		"@clack/prompts": "^1.8.1",
+		"commander": "^15.0.0",
+		"jose": "^6.2.12",
+		"picocolors": "^1.1.1"
+	},
+	"lint-staged": {
+		"*.{ts,js,mjs,cjs}": [
+			"eslint --fix --max-warnings=0",
+			"prettier --write"
+		],
+		"*.{json,md,yml,yaml}": [
+			"prettier --write"
+		]
+	}
 }
