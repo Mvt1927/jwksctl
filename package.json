@@ -1,6 +1,6 @@
 {
 	"name": "jwksctl",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Production-grade CLI for JWKS lifecycle management, key rotation, signing, and verification",
 	"author": "Mvt1927",
 	"license": "MIT",
