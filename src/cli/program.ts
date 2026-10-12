@@ -15,12 +15,18 @@ import { exportPublicJwkToPem } from "../core/crypto.ts";
 import { KeyManagerService } from "../core/key-manager.ts";
 import { PemVault } from "../core/pem-vault.ts";
 import type { KeyStatus, SigningAlgorithm } from "../core/types.ts";
-import { interactiveRemoveFlow, runInteractiveWizard } from "./interactive.ts";
+import {
+	interactiveRemoveFlow,
+	interactiveRestoreFlow,
+	interactiveTrashFlow,
+	runInteractiveWizard,
+} from "./interactive.ts";
 import {
 	renderInspectReport,
 	renderIntegrityReport,
 	renderKeyTable,
 	renderMutationDiff,
+	renderTrashTable,
 } from "./output.ts";
 
 interface GlobalCliOpts extends RuntimeOptions {
@@ -343,24 +349,31 @@ export function buildCliProgram(): Command {
 			},
 		);
 
-	// 7. Lệnh remove (Hỗ trợ xóa 1 hoặc nhiều khóa cùng lúc + SafeMutationGuard)
+	// 7. Lệnh remove (Hỗ trợ xóa 1 hoặc nhiều khóa cùng lúc + đưa vào Thùng rác .trash)
 	program
 		.command("remove [kids...]")
 		.alias("rm")
 		.description(
-			"Xóa an toàn 1 hoặc nhiều khóa trong Store (hỗ trợ chọn Checkbox nhiều khóa nếu không truyền kid)",
+			"Xóa an toàn 1 hoặc nhiều khóa (mặc định đưa khóa & file .pem vào Thùng rác .trash để có thể restore)",
 		)
 		.option("-f, --force", "Cho phép xóa cả khóa đang ở trạng thái 'active'")
-		.option("--delete-pem", "Xóa luôn các file Private Key (.pem) tương ứng trên đĩa")
+		.option("--permanent", "Xóa vĩnh viễn không qua Thùng rác (xóa hẳn file .pem trên ổ đĩa)")
+		.option(
+			"--delete-pem",
+			"Tương đương --permanent (xóa vĩnh viễn file Private Key .pem trên đĩa)",
+		)
 		.option("-y, --yes", "Bỏ qua bước hỏi xác nhận tương tác (dùng cho CI/CD)")
 		.action(
-			async (rawKids: string[], opts: { force?: boolean; deletePem?: boolean; yes?: boolean }) => {
+			async (
+				rawKids: string[],
+				opts: { force?: boolean; permanent?: boolean; deletePem?: boolean; yes?: boolean },
+			) => {
 				const globalOpts = program.opts<GlobalCliOpts>();
-				// Hỗ trợ cả truyền cách nhau bằng khoảng trắng hoặc dấu phẩy (kid1,kid2)
 				const parsedKids = rawKids
 					.flatMap((item) => item.split(","))
 					.map((s) => s.trim())
 					.filter(Boolean);
+				const isPermanent = Boolean(opts.permanent || opts.deletePem);
 
 				await withManager(globalOpts, async (manager) => {
 					if (parsedKids.length === 0 || (!opts.yes && !globalOpts.json && process.stdin.isTTY)) {
@@ -369,24 +382,33 @@ export function buildCliProgram(): Command {
 								"Vui lòng truyền ít nhất 1 mã khóa (kid) cần xóa khi chạy ở chế độ non-interactive.",
 							);
 						}
-						await interactiveRemoveFlow(manager, parsedKids, opts.force);
+						await interactiveRemoveFlow(manager, parsedKids, opts.force, isPermanent);
 						return;
 					}
 
-					const { diff, deletedPemPaths } = await manager.removeKeys(parsedKids, {
+					const { diff, trashedItems, deletedPemPaths } = await manager.removeKeys(parsedKids, {
 						force: Boolean(opts.force),
-						deletePrivateKeyFiles: Boolean(opts.deletePem),
+						permanent: isPermanent,
 					});
 
 					if (globalOpts.json) {
-						console.log(JSON.stringify({ diff, deletedPemPaths }, null, 2));
+						console.log(
+							JSON.stringify(
+								{ diff, trashedItems, deletedPemPaths, permanent: isPermanent },
+								null,
+								2,
+							),
+						);
 					} else {
 						console.log(renderMutationDiff(diff));
-						console.log(
-							`${pc.green("✓")} Đã xóa an toàn ${diff.removed.length} khóa. Giữ nguyên 100% ${diff.afterCount} khóa còn lại.`,
-						);
-						if (deletedPemPaths.length > 0) {
-							console.log(`  Đã xóa file .pem: ${deletedPemPaths.join(", ")}`);
+						if (isPermanent) {
+							console.log(
+								`${pc.green("✓")} Đã xóa vĩnh viễn ${diff.removed.length} khóa và ${deletedPemPaths.length} file .pem. Giữ nguyên 100% ${diff.afterCount} khóa còn lại.`,
+							);
+						} else {
+							console.log(
+								`${pc.green("✓")} Đã chuyển ${trashedItems.length} khóa & file .pem vào Thùng rác (${pc.cyan(manager.vault.trashDir)}). Giữ nguyên 100% ${diff.afterCount} khóa còn lại.`,
+							);
 						}
 					}
 				});
@@ -397,12 +419,14 @@ export function buildCliProgram(): Command {
 	program
 		.command("prune")
 		.description("Dọn dẹp tự động các khóa đã bị thu hồi (revoked) hoặc passive đã hết hạn")
-		.option("--delete-pem", "Xóa luôn các file Private Key (.pem) của những khóa bị dọn dẹp")
-		.action(async (opts: { deletePem?: boolean }) => {
+		.option("--permanent", "Xóa vĩnh viễn các file Private Key (.pem) thay vì đưa vào Thùng rác")
+		.option("--delete-pem", "Tương đương --permanent")
+		.action(async (opts: { permanent?: boolean; deletePem?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
+			const isPermanent = Boolean(opts.permanent || opts.deletePem);
 			await withManager(globalOpts, async (manager) => {
 				const result = await manager.pruneKeys({
-					deletePrivateKeyFiles: Boolean(opts.deletePem),
+					permanent: isPermanent,
 				});
 
 				if (globalOpts.json) {
@@ -417,27 +441,130 @@ export function buildCliProgram(): Command {
 
 				console.log(renderMutationDiff(result.diff));
 				console.log(
-					`${pc.green("✓")} Đã dọn dẹp ${result.prunedKids.length} khóa: ${result.prunedKids.join(", ")}`,
+					`${pc.green("✓")} Đã dọn dẹp ${result.prunedKids.length} khóa (${isPermanent ? "xóa vĩnh viễn" : `chuyển vào ${manager.vault.trashDir}`}): ${result.prunedKids.join(", ")}`,
 				);
 			});
 		});
 
-	// 9. Lệnh restore (Khôi phục từ file .bak)
+	// 9. Lệnh restore (Khôi phục cả khóa JWK lẫn file .pem từ Thùng rác .trash hoặc file .bak)
 	program
-		.command("restore")
-		.description("Khôi phục file jwks.json từ bản sao lưu tự động (.bak) gần nhất")
+		.command("restore [kids...]")
+		.description(
+			"Khôi phục khóa JWK và file Private Key (.pem) từ Thùng rác (.trash) hoặc từ bản sao lưu (.bak)",
+		)
+		.option("--from-bak", "Khôi phục từ file jwks.json.bak kết hợp lấy lại file .pem từ Thùng rác")
+		.option("--all", "Khôi phục toàn bộ các khóa đang có trong Thùng rác")
+		.option("-y, --yes", "Bỏ qua giao diện chọn tương tác")
+		.action(
+			async (rawKids: string[], opts: { fromBak?: boolean; all?: boolean; yes?: boolean }) => {
+				const globalOpts = program.opts<GlobalCliOpts>();
+				const parsedKids = rawKids
+					.flatMap((item) => item.split(","))
+					.map((s) => s.trim())
+					.filter(Boolean);
+
+				await withManager(globalOpts, async (manager) => {
+					if (
+						!opts.fromBak &&
+						!opts.all &&
+						parsedKids.length === 0 &&
+						!opts.yes &&
+						!globalOpts.json &&
+						process.stdin.isTTY
+					) {
+						await interactiveRestoreFlow(manager);
+						return;
+					}
+
+					const res = await manager.restoreKeys({
+						kids: parsedKids,
+						fromBak: Boolean(opts.fromBak),
+					});
+					const allKeysAfter = await manager.listKeys();
+
+					if (globalOpts.json) {
+						console.log(
+							JSON.stringify(
+								{
+									mode: res.mode,
+									restoredCount: allKeysAfter.length,
+									restoredFromTrashCount: res.restoredRecords.length,
+									restoredPemPaths: res.restoredPemPaths,
+									keys: res.restoredRecords,
+								},
+								null,
+								2,
+							),
+						);
+					} else {
+						console.log(
+							`${pc.green("✓")} Đã khôi phục thành công ${res.restoredRecords.length} khóa (${res.mode === "trash" ? "từ Thùng rác .trash" : "từ bản sao lưu .bak"}) vào ${manager.adapter.location}.`,
+						);
+						if (res.restoredPemPaths.length > 0) {
+							console.log(
+								`  ${pc.green("✓")} Đã trả lại ${res.restoredPemPaths.length} file Private Key (.pem) về thư mục gốc: ${pc.bold(res.restoredPemPaths.join(", "))}`,
+							);
+						}
+					}
+				});
+			},
+		);
+
+	// 9b. Nhóm lệnh trash (Quản lý Thùng rác ./keys/.trash)
+	const trashCmd = program
+		.command("trash")
+		.description("Quản lý Thùng rác chứa các khóa và file .pem đã xóa (./keys/.trash)")
 		.action(async () => {
 			const globalOpts = program.opts<GlobalCliOpts>();
 			await withManager(globalOpts, async (manager) => {
-				if (!manager.adapter.restoreBackup) {
-					throw new Error(`Adapter "${manager.adapter.kind}" không sử dụng file sao lưu .bak.`);
+				if (!globalOpts.json && process.stdin.isTTY) {
+					await interactiveTrashFlow(manager);
+					return;
 				}
-				const restored = await manager.adapter.restoreBackup();
+				const items = await manager.listTrash();
 				if (globalOpts.json) {
-					console.log(JSON.stringify({ restoredCount: restored.length, keys: restored }, null, 2));
+					console.log(JSON.stringify({ trashDir: manager.vault.trashDir, items }, null, 2));
+				} else {
+					console.log(renderTrashTable(items));
+				}
+			});
+		});
+
+	trashCmd
+		.command("list")
+		.alias("ls")
+		.description("Liệt kê các khóa và file .pem đang nằm trong Thùng rác")
+		.action(async () => {
+			const globalOpts = program.opts<GlobalCliOpts>();
+			await withManager(globalOpts, async (manager) => {
+				const items = await manager.listTrash();
+				if (globalOpts.json) {
+					console.log(JSON.stringify({ trashDir: manager.vault.trashDir, items }, null, 2));
+				} else {
+					console.log(renderTrashTable(items));
+				}
+			});
+		});
+
+	trashCmd
+		.command("empty [kids...]")
+		.description("Dọn sạch vĩnh viễn toàn bộ (hoặc một số kid) trong Thùng rác")
+		.action(async (rawKids: string[]) => {
+			const globalOpts = program.opts<GlobalCliOpts>();
+			const parsedKids = rawKids
+				.flatMap((item) => item.split(","))
+				.map((s) => s.trim())
+				.filter(Boolean);
+
+			await withManager(globalOpts, async (manager) => {
+				const deletedCount = await manager.emptyTrash(
+					parsedKids.length > 0 ? parsedKids : undefined,
+				);
+				if (globalOpts.json) {
+					console.log(JSON.stringify({ emptiedCount: deletedCount }, null, 2));
 				} else {
 					console.log(
-						`${pc.green("✓")} Đã khôi phục thành công ${restored.length} khóa từ bản sao lưu (.bak) cho ${manager.adapter.location}.`,
+						`${pc.green("✓")} Đã xóa vĩnh viễn ${deletedCount} mục khỏi Thùng rác (${manager.vault.trashDir}).`,
 					);
 				}
 			});

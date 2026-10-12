@@ -4,7 +4,7 @@ import {
 	type InspectKeyResult,
 	type IntegrityCheckReport,
 } from "../core/key-manager.ts";
-import type { JwkRecord, KeyStatus, MutationDiff } from "../core/types.ts";
+import type { JwkRecord, KeyStatus, MutationDiff, TrashItem } from "../core/types.ts";
 
 export function formatStatusBadge(status: KeyStatus, expired: boolean = false): string {
 	if (status === "active") {
@@ -158,4 +158,41 @@ export function renderIntegrityReport(report: IntegrityCheckReport, storeLocatio
 	);
 
 	return lines.join("\n");
+}
+
+export function renderTrashTable(items: readonly TrashItem[]): string {
+	if (items.length === 0) {
+		return pc.dim("  (Thùng rác .trash hiện đang trống)");
+	}
+
+	const headers = [
+		{ label: "KID", width: 24 },
+		{ label: "ALG", width: 8 },
+		{ label: "STATUS CŨ", width: 14 },
+		{ label: "DELETED AT", width: 20 },
+		{ label: "TRASH PEM", width: 34 },
+		{ label: "ORIGINAL PEM PATH", width: 28 },
+	];
+
+	const headerLine = headers.map((h) => padRight(pc.bold(pc.cyan(h.label)), h.width)).join("  ");
+	const separator = headers.map((h) => pc.dim("─".repeat(h.width))).join("──");
+
+	const rows = items.map((item) => {
+		const { record } = item;
+		const deletedAtStr = item.deletedAt.slice(0, 19).replace("T", " ");
+		const trashPemDisplay = item.trashPemPath
+			? pc.green(`✓ ${item.trashPemPath}`)
+			: pc.red("✗ Không có file .pem");
+
+		return [
+			padRight(pc.bold(record.kid), headers[0]!.width),
+			padRight(record.alg, headers[1]!.width),
+			padRight(record.status, headers[2]!.width),
+			padRight(pc.yellow(deletedAtStr), headers[3]!.width),
+			padRight(trashPemDisplay, headers[4]!.width),
+			padRight(pc.dim(record.privateKeyPath), headers[5]!.width),
+		].join("  ");
+	});
+
+	return [headerLine, separator, ...rows].join("\n");
 }

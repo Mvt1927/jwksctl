@@ -67,20 +67,29 @@ bun run index.ts inspect <kid>
 bun run index.ts check
 ```
 
-### 4. Xóa an toàn 1 hoặc nhiều khóa (`remove`), Dọn dẹp (`prune`) & Khôi phục (`restore`)
+### 4. Xóa an toàn (`remove`), Thùng rác (`trash`), Dọn dẹp (`prune`) & Khôi phục (`restore`)
+
+Mặc định khi xóa khóa (`remove` hoặc `prune`), cả bản ghi JWK lẫn file Private Key (`.pem`) sẽ được chuyển vào **Thùng rác (`./keys/.trash/`)** để bạn có thể khôi phục lại nguyên vẹn cả khóa lẫn file `.pem` trên mọi Store (File JSON, SQLite, MongoDB, PostgreSQL, MySQL).
 
 ```bash
-# Mở menu Checkbox tương tác để tích chọn 1 hoặc nhiều khóa cần xóa trong jwks.json
+# Mở menu Checkbox tương tác để tích chọn 1 hoặc nhiều khóa cần xóa
 bun run index.ts remove
 
-# Xóa nhiều khóa chỉ định trên dòng lệnh (kèm tùy chọn xóa luôn file .pem)
-bun run index.ts remove <kid1> <kid2> --delete-pem
+# Xóa khóa trên dòng lệnh (mặc định đưa vào ./keys/.trash; thêm --permanent nếu muốn xóa vĩnh viễn)
+bun run index.ts remove <kid1> <kid2>
+bun run index.ts remove <kid1> --permanent
+
+# Khôi phục khóa & trả lại file .pem từ Thùng rác (mở Checkbox tương tác hoặc truyền kid / --all)
+bun run index.ts restore
+bun run index.ts restore <kid1>
+bun run index.ts restore --from-bak
+
+# Xem danh sách khóa trong Thùng rác hoặc dọn sạch vĩnh viễn Thùng rác
+bun run index.ts trash list
+bun run index.ts trash empty
 
 # Tự động dọn dẹp các khóa đã bị thu hồi (revoked) hoặc passive đã hết hạn
 bun run index.ts prune
-
-# Khôi phục jwks.json từ bản sao lưu jwks.json.bak gần nhất
-bun run index.ts restore
 ```
 
 ### 5. Xuất Public JWKS chuẩn RFC 7517 (`export`), Ký/Xác thực JWT (`sign`/`verify`) & Server (`serve`)

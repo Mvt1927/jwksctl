@@ -20,15 +20,17 @@ import {
 	renderIntegrityReport,
 	renderKeyTable,
 	renderMutationDiff,
+	renderTrashTable,
 } from "./output.ts";
 
 /**
- * Hỏi người dùng chọn 1 hoặc nhiều khóa để xóa an toàn (có hiển thị Diff Preview & hỏi xóa file .pem).
+ * Hỏi người dùng chọn 1 hoặc nhiều khóa để xóa an toàn (mặc định đưa khóa + file .pem vào Thùng rác .trash).
  */
 export async function interactiveRemoveFlow(
 	manager: KeyManagerService,
 	preselectedKids?: string[],
 	forceOption?: boolean,
+	permanentOption?: boolean,
 ): Promise<void> {
 	const allKeys = await manager.listKeys();
 	if (allKeys.length === 0) {
@@ -80,34 +82,158 @@ export async function interactiveRemoveFlow(
 	});
 	note(renderMutationDiff(diffPreview), "Xem trước thay đổi (SafeMutationGuard)");
 
+	let isPermanent = Boolean(permanentOption);
+	if (!permanentOption) {
+		const mode = await select({
+			message: `Chọn chế độ xóa cho ${selectedKids.length} khóa đã chọn (còn lại ${diffPreview.afterCount} khóa giữ nguyên 100%):`,
+			options: [
+				{
+					value: "trash",
+					label: `♻️  Đưa khóa & file .pem vào Thùng rác (${manager.vault.trashDir}) — Khuyên dùng`,
+					hint: "Có thể khôi phục lại cả khóa lẫn file .pem bằng lệnh restore",
+				},
+				{
+					value: "permanent",
+					label: "🔥 Xóa vĩnh viễn (Xóa hẳn khỏi Store và xóa vĩnh viễn file .pem trên đĩa)",
+					hint: "Không thể khôi phục lại file .pem",
+				},
+			],
+			initialValue: "trash",
+		});
+		if (isCancel(mode)) {
+			cancel("Đã hủy thao tác xóa khóa.");
+			return;
+		}
+		isPermanent = mode === "permanent";
+	}
+
 	const confirmDelete = await confirm({
-		message: `Xác nhận xóa ${selectedKids.length} khóa đã chọn khỏi Store (còn lại ${diffPreview.afterCount} khóa được giữ nguyên 100%)?`,
-		initialValue: false,
+		message: isPermanent
+			? `Xác nhận XÓA VĨNH VIỄN ${selectedKids.length} khóa và file .pem tương ứng?`
+			: `Xác nhận chuyển ${selectedKids.length} khóa và file .pem vào Thùng rác?`,
+		initialValue: !isPermanent,
 	});
 	if (isCancel(confirmDelete) || !confirmDelete) {
 		cancel("Đã hủy thao tác xóa khóa.");
 		return;
 	}
 
-	const askDeletePem = await confirm({
-		message: "Bạn có muốn xóa luôn file Private Key (.pem) tương ứng trên ổ đĩa không?",
-		initialValue: false,
+	const { diff, trashedItems, deletedPemPaths } = await manager.removeKeys(selectedKids, {
+		force: allowForce,
+		permanent: isPermanent,
 	});
-	if (isCancel(askDeletePem)) {
-		cancel("Đã hủy thao tác.");
+
+	if (isPermanent) {
+		log.success(
+			`Đã xóa vĩnh viễn ${diff.removed.length} khóa và ${deletedPemPaths.length} file .pem. Bảo toàn nguyên vẹn ${diff.afterCount} khóa còn lại.`,
+		);
+	} else {
+		log.success(
+			`Đã chuyển ${trashedItems.length} khóa (cùng file .pem) vào Thùng rác (${pc.cyan(manager.vault.trashDir)}). Bảo toàn nguyên vẹn ${diff.afterCount} khóa còn lại.`,
+		);
+		log.info(
+			`Gợi ý: Chạy ${pc.cyan("jwksctl restore")} bất kỳ lúc nào để khôi phục lại cả khóa và file .pem.`,
+		);
+	}
+}
+
+/**
+ * Luồng tương tác chọn 1 hoặc nhiều khóa trong Thùng rác (.trash) để khôi phục cả JWK và file .pem.
+ */
+export async function interactiveRestoreFlow(manager: KeyManagerService): Promise<void> {
+	const trashItems = await manager.listTrash();
+	if (trashItems.length === 0) {
+		log.warn(`Thùng rác (${manager.vault.trashDir}) hiện đang trống.`);
+		if (manager.adapter.restoreBackup) {
+			const askBak = await confirm({
+				message: "Bạn có muốn thử khôi phục từ file sao lưu .bak gần nhất không?",
+				initialValue: false,
+			});
+			if (!isCancel(askBak) && askBak) {
+				const res = await manager.restoreKeys({ fromBak: true });
+				log.success(
+					`Đã khôi phục ${res.restoredRecords.length} khóa từ bản sao lưu (.bak) và ${res.restoredPemPaths.length} file .pem.`,
+				);
+			}
+		}
 		return;
 	}
 
-	const { diff, deletedPemPaths } = await manager.removeKeys(selectedKids, {
-		force: allowForce,
-		deletePrivateKeyFiles: Boolean(askDeletePem),
+	const picked = await multiselect({
+		message:
+			"Chọn 1 hoặc nhiều khóa trong Thùng rác cần khôi phục (Space để chọn, Enter để xác nhận):",
+		options: trashItems.map((item) => ({
+			value: item.record.kid,
+			label: `${item.record.kid} [${item.record.alg}] — status cũ: ${item.record.status}`,
+			hint: `Xóa lúc: ${item.deletedAt.slice(0, 19).replace("T", " ")} | pem: ${
+				item.trashPemPath
+					? `✓ Có file trong .trash → trả về ${item.record.privateKeyPath}`
+					: "✗ Không có file .pem"
+			}`,
+		})),
+		required: true,
+	});
+
+	if (isCancel(picked)) {
+		cancel("Đã hủy thao tác khôi phục.");
+		return;
+	}
+
+	const selectedKids = picked as string[];
+	const { restoredRecords, restoredPemPaths } = await manager.restoreKeys({
+		kids: selectedKids,
 	});
 
 	log.success(
-		`Đã xóa an toàn ${diff.removed.length} khóa. Bảo toàn nguyên vẹn ${diff.afterCount} khóa còn lại.`,
+		`Đã khôi phục thành công ${restoredRecords.length} khóa vào Store (${manager.adapter.location})!`,
 	);
-	if (deletedPemPaths.length > 0) {
-		log.info(`Đã xóa ${deletedPemPaths.length} file Private Key: ${deletedPemPaths.join(", ")}`);
+	if (restoredPemPaths.length > 0) {
+		log.info(
+			`Đã trả lại ${restoredPemPaths.length} file Private Key (.pem) về thư mục gốc: ${restoredPemPaths.join(", ")}`,
+		);
+	}
+}
+
+/**
+ * Luồng quản lý Thùng rác tương tác (xem danh sách, khôi phục hoặc dọn sạch vĩnh viễn).
+ */
+export async function interactiveTrashFlow(manager: KeyManagerService): Promise<void> {
+	const trashItems = await manager.listTrash();
+	console.log("\n" + renderTrashTable(trashItems) + "\n");
+
+	if (trashItems.length === 0) {
+		return;
+	}
+
+	const subAction = await select({
+		message: `Thùng rác hiện có ${trashItems.length} khóa. Bạn muốn làm gì?`,
+		options: [
+			{ value: "restore", label: "♻️  Chọn khóa để khôi phục lại vào Store & trả lại file .pem" },
+			{ value: "empty", label: "🔥 Dọn sạch Thùng rác (Xóa vĩnh viễn các file .pem trong .trash)" },
+			{ value: "back", label: "⬅️  Quay lại / Thoát" },
+		],
+	});
+
+	if (isCancel(subAction) || subAction === "back") {
+		return;
+	}
+
+	if (subAction === "restore") {
+		await interactiveRestoreFlow(manager);
+		return;
+	}
+
+	if (subAction === "empty") {
+		const confirmEmpty = await confirm({
+			message: `Bạn có chắc chắn muốn XÓA VĨNH VIỄN toàn bộ ${trashItems.length} khóa và file .pem trong Thùng rác không?`,
+			initialValue: false,
+		});
+		if (isCancel(confirmEmpty) || !confirmEmpty) {
+			cancel("Đã hủy thao tác dọn Thùng rác.");
+			return;
+		}
+		const count = await manager.emptyTrash();
+		log.success(`Đã dọn sạch vĩnh viễn ${count} mục khỏi Thùng rác.`);
 	}
 }
 
@@ -126,7 +252,9 @@ export async function runInteractiveWizard(
 			{ value: "generate", label: "✨ Tạo cặp khóa mới (generate)" },
 			{ value: "rotate", label: "🔄 Xoay vòng khóa an toàn (rotate)" },
 			{ value: "inspect", label: "🔍 Xem chi tiết khóa & SPKI PEM (inspect)" },
-			{ value: "remove", label: "🗑️  Xóa 1 hoặc nhiều khóa cùng lúc (remove)" },
+			{ value: "remove", label: "🗑️  Xóa 1 hoặc nhiều khóa vào Thùng rác (remove)" },
+			{ value: "restore", label: "♻️  Khôi phục khóa & file .pem từ Thùng rác (restore)" },
+			{ value: "trash", label: "🧹 Xem / Dọn sạch Thùng rác (trash)" },
 			{ value: "export", label: "📤 Xuất Public JWKS chuẩn RFC 7517 (export)" },
 			{ value: "check", label: "🛡️  Kiểm tra toàn vẹn Store & file .pem (check)" },
 		],
@@ -262,6 +390,16 @@ export async function runInteractiveWizard(
 
 		case "remove": {
 			await interactiveRemoveFlow(manager);
+			break;
+		}
+
+		case "restore": {
+			await interactiveRestoreFlow(manager);
+			break;
+		}
+
+		case "trash": {
+			await interactiveTrashFlow(manager);
 			break;
 		}
 

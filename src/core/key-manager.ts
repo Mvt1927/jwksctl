@@ -16,6 +16,7 @@ import type {
 	MutationDiff,
 	PublicJwksPayload,
 	SigningAlgorithm,
+	TrashItem,
 } from "./types.ts";
 import type { IStorageAdapter } from "../storage/adapter.ts";
 
@@ -223,35 +224,50 @@ export class KeyManagerService {
 	}
 
 	/**
-	 * Xóa 1 hoặc nhiều khóa khỏi Store (có kiểm tra chống xóa nhầm và tùy chọn xóa file .pem).
+	 * Xóa 1 hoặc nhiều khóa khỏi Store:
+	 * - Mặc định chuyển bản ghi JWK và file .pem vào Thùng rác (`./keys/.trash/`) để có thể restore lại cả file .pem.
+	 * - Nếu truyền `permanent: true`, xóa vĩnh viễn file .pem trên đĩa.
 	 */
 	async removeKeys(
 		kidsToRemove: readonly string[],
-		options: { force?: boolean; deletePrivateKeyFiles?: boolean } = {},
-	): Promise<{ diff: MutationDiff; deletedPemPaths: string[] }> {
+		options: { force?: boolean; deletePrivateKeyFiles?: boolean; permanent?: boolean } = {},
+	): Promise<{ diff: MutationDiff; trashedItems: TrashItem[]; deletedPemPaths: string[] }> {
 		const diff = await this.adapter.removeKeys(kidsToRemove, {
 			force: options.force,
 		});
 
+		const trashedItems: TrashItem[] = [];
 		const deletedPemPaths: string[] = [];
-		if (options.deletePrivateKeyFiles) {
-			for (const removedRec of diff.removed) {
+
+		for (const removedRec of diff.removed) {
+			if (options.permanent) {
 				const deleted = await this.vault.deletePrivateKey(removedRec.privateKeyPath);
 				if (deleted) {
+					deletedPemPaths.push(removedRec.privateKeyPath);
+				}
+			} else {
+				const item = await this.vault.moveToTrash(removedRec);
+				trashedItems.push(item);
+				if (item.trashPemPath) {
 					deletedPemPaths.push(removedRec.privateKeyPath);
 				}
 			}
 		}
 
-		return { diff, deletedPemPaths };
+		return { diff, trashedItems, deletedPemPaths };
 	}
 
 	/**
 	 * Dọn dẹp các khóa đã bị thu hồi (`revoked`) hoặc khóa `passive` đã hết thời gian ân hạn (`expiresAt`).
 	 */
 	async pruneKeys(
-		options: { deletePrivateKeyFiles?: boolean; now?: Date } = {},
-	): Promise<{ diff: MutationDiff; prunedKids: string[]; deletedPemPaths: string[] }> {
+		options: { deletePrivateKeyFiles?: boolean; permanent?: boolean; now?: Date } = {},
+	): Promise<{
+		diff: MutationDiff;
+		prunedKids: string[];
+		trashedItems: TrashItem[];
+		deletedPemPaths: string[];
+	}> {
 		const now = options.now ?? new Date();
 		const all = await this.adapter.listKeys();
 		const targets = all.filter(
@@ -262,20 +278,98 @@ export class KeyManagerService {
 			return {
 				diff: SafeMutationGuard.computeDiff(all, all),
 				prunedKids: [],
+				trashedItems: [],
 				deletedPemPaths: [],
 			};
 		}
 
 		const targetKids = targets.map((k) => k.kid);
-		const { diff, deletedPemPaths } = await this.removeKeys(targetKids, {
+		const { diff, trashedItems, deletedPemPaths } = await this.removeKeys(targetKids, {
 			force: false,
 			deletePrivateKeyFiles: options.deletePrivateKeyFiles,
+			permanent: options.permanent,
 		});
 
 		return {
 			diff,
 			prunedKids: targetKids,
+			trashedItems,
 			deletedPemPaths,
+		};
+	}
+
+	async listTrash(): Promise<TrashItem[]> {
+		return this.vault.listTrash();
+	}
+
+	async emptyTrash(kids?: readonly string[]): Promise<number> {
+		return this.vault.emptyTrash(kids);
+	}
+
+	/**
+	 * Khôi phục khóa và file Private Key (.pem) từ Thùng rác (hoặc từ file .bak kết hợp Thùng rác).
+	 */
+	async restoreKeys(options: { kids?: readonly string[]; fromBak?: boolean } = {}): Promise<{
+		restoredRecords: JwkRecord[];
+		restoredPemPaths: string[];
+		mode: "trash" | "bak";
+	}> {
+		const trashItems = await this.vault.listTrash();
+		const requestedKids = options.kids?.filter(Boolean) ?? [];
+
+		// Ưu tiên khôi phục từ Thùng rác (.trash) để tương thích mọi Store (File, SQLite, Mongo, Postgres, MySQL)
+		if (!options.fromBak && (requestedKids.length > 0 || trashItems.length > 0)) {
+			const existingKeys = await this.adapter.listKeys();
+			const existingKidSet = new Set(existingKeys.map((k) => k.kid));
+
+			const targetKids =
+				requestedKids.length > 0
+					? requestedKids
+					: trashItems.map((item) => item.record.kid).filter((kid) => !existingKidSet.has(kid));
+
+			if (targetKids.length === 0) {
+				throw new Error(
+					"Không có khóa nào trong Thùng rác cần khôi phục (hoặc tất cả đã tồn tại trong Store).",
+				);
+			}
+
+			const restoredRecords: JwkRecord[] = [];
+			const restoredPemPaths: string[] = [];
+
+			for (const kid of targetKids) {
+				const item = await this.vault.restoreFromTrash(kid);
+				if (!existingKidSet.has(item.record.kid)) {
+					restoredRecords.push(item.record);
+				}
+				if (await this.vault.exists(item.record.privateKeyPath)) {
+					restoredPemPaths.push(item.record.privateKeyPath);
+				}
+			}
+
+			if (restoredRecords.length > 0) {
+				await this.adapter.addKeys(restoredRecords);
+			}
+
+			return {
+				restoredRecords,
+				restoredPemPaths,
+				mode: "trash",
+			};
+		}
+
+		// Fallback hoặc khi chỉ định --from-bak: Khôi phục từ jwks.json.bak + lấy lại file .pem từ Thùng rác
+		if (!this.adapter.restoreBackup) {
+			throw new Error(
+				`Thùng rác hiện đang trống và Adapter "${this.adapter.kind}" không có file .bak để khôi phục.`,
+			);
+		}
+
+		const restoredRecords = await this.adapter.restoreBackup();
+		const restoredPemPaths = await this.vault.restoreMissingPemsForRecords(restoredRecords);
+		return {
+			restoredRecords,
+			restoredPemPaths,
+			mode: "bak",
 		};
 	}
 
