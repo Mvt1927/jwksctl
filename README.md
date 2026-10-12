@@ -69,13 +69,13 @@ bun run index.ts check
 
 ### 4. Xóa an toàn (`remove`), Thùng rác (`trash`), Dọn dẹp (`prune`) & Khôi phục (`restore`)
 
-Mặc định khi xóa khóa (`remove` hoặc `prune`), cả bản ghi JWK lẫn file Private Key (`.pem`) sẽ được chuyển vào **Thùng rác (`./keys/.trash/`)** để bạn có thể khôi phục lại nguyên vẹn cả khóa lẫn file `.pem` trên mọi Store (File JSON, SQLite, MongoDB, PostgreSQL, MySQL).
+Mặc định `jwks.json` (Store gốc), `keys/` và **Thùng rác (`.trash/`)** đều được lưu cố định tại **thư mục cài đặt `jwksctl`**. Khi xóa khóa (`remove` hoặc `prune`), cả bản ghi JWK lẫn file Private Key (`.pem`) sẽ được chuyển vào `<installDir>/.trash/` để bạn có thể khôi phục lại nguyên vẹn cả khóa lẫn file `.pem` trên mọi Store.
 
 ```bash
 # Mở menu Checkbox tương tác để tích chọn 1 hoặc nhiều khóa cần xóa
 bun run index.ts remove
 
-# Xóa khóa trên dòng lệnh (mặc định đưa vào ./keys/.trash; thêm --permanent nếu muốn xóa vĩnh viễn)
+# Xóa khóa trên dòng lệnh (mặc định đưa vào .trash; thêm --permanent nếu muốn xóa vĩnh viễn)
 bun run index.ts remove <kid1> <kid2>
 bun run index.ts remove <kid1> --permanent
 
@@ -92,11 +92,17 @@ bun run index.ts trash empty
 bun run index.ts prune
 ```
 
-### 5. Xuất Public JWKS chuẩn RFC 7517 (`export`), Ký/Xác thực JWT (`sign`/`verify`) & Server (`serve`)
+### 5. Xuất & Merge Public JWKS chuẩn RFC 7517 (`export`), Ký/Xác thực JWT (`sign`/`verify`) & Server (`serve`)
+
+Khi chạy `export` ra một file (ví dụ `./jwks.json` ở thư mục dự án hiện tại), nếu file đó **đã tồn tại**, `jwksctl` sẽ tự động hiển thị **Bảng đối chiếu Merge** và mở Checkbox tương tác để bạn chọn **khóa nào giữ lại (`keep`), khóa nào loại bỏ (`drop`)**:
 
 ```bash
-# Xuất bộ Public JWKS tinh khiết (đã lọc sạch metadata nội bộ) ra file hoặc màn hình
+# Xuất Public JWKS ra file ./jwks.json tại thư mục hiện tại (hiện Bảng Merge nếu file đã tồn tại)
+bun run index.ts export ./jwks.json
 bun run index.ts export --output ./public-jwks.json
+
+# Xuất tự động trên CI/CD kèm chọn lọc khóa giữ/bỏ
+bun run index.ts export -o ./jwks.json --drop old-kid-1 -y
 
 # Ký thử và xác thực thử JWT
 TOKEN=$(bun run index.ts sign --data '{"sub":"user-1","role":"admin"}' --expires-in 1h)

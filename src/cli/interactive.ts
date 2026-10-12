@@ -12,10 +12,12 @@ import {
 	spinner,
 	text,
 } from "@clack/prompts";
+import { resolve } from "node:path";
 import pc from "picocolors";
 import type { KeyManagerService } from "../core/key-manager.ts";
 import { SUPPORTED_ALGORITHMS, type SigningAlgorithm } from "../core/types.ts";
 import {
+	renderExportMergeTable,
 	renderInspectReport,
 	renderIntegrityReport,
 	renderKeyTable,
@@ -237,6 +239,108 @@ export async function interactiveTrashFlow(manager: KeyManagerService): Promise<
 	}
 }
 
+/**
+ * Luồng xuất Public JWKS ra file đích:
+ * - Tự động kiểm tra xem file đích (ví dụ ./jwks.json) đã tồn tại chưa.
+ * - Nếu đã tồn tại, hiển thị Bảng đối chiếu Merge và cho phép tích chọn (Checkbox) khóa nào GIỮ, khóa nào BỎ.
+ */
+export async function interactiveExportFlow(
+	manager: KeyManagerService,
+	options: { outputFile?: string; includePassive?: boolean } = {},
+): Promise<void> {
+	let targetFile = options.outputFile;
+	const cwdJwksPath = resolve(process.cwd(), "jwks.json");
+	const storeAbsPath = resolve(manager.adapter.location);
+	const defaultTarget = cwdJwksPath === storeAbsPath ? "./public-jwks.json" : "./jwks.json";
+
+	if (!targetFile) {
+		const entered = await text({
+			message:
+				"Nhập đường dẫn file đích muốn xuất Public JWKS (hoặc gõ 'stdout' để chỉ in ra màn hình):",
+			initialValue: defaultTarget,
+			placeholder: defaultTarget,
+		});
+		if (isCancel(entered)) {
+			cancel("Đã hủy thao tác export.");
+			return;
+		}
+		targetFile = String(entered || defaultTarget).trim();
+	}
+
+	if (targetFile.toLowerCase() === "stdout" || targetFile === "-") {
+		const exported = await manager.exportPublicJwks({
+			includePassive: options.includePassive,
+		});
+		console.log(JSON.stringify(exported, null, 2));
+		return;
+	}
+
+	const absOutPath = resolve(process.cwd(), targetFile);
+	if (absOutPath === storeAbsPath) {
+		log.warn(
+			pc.yellow(
+				`Đường dẫn ${absOutPath} trùng với file Store gốc của jwksctl. Vui lòng chọn đường dẫn file xuất khác (ví dụ ./public-jwks.json hoặc đứng tại thư mục dự án cần xuất) để không làm mất metadata privateKeyPath của Store gốc.`,
+			),
+		);
+		return;
+	}
+
+	const plan = await manager.prepareExportMergePlan(absOutPath, {
+		includePassive: options.includePassive,
+	});
+
+	if (!plan.targetFileExists) {
+		const allKids = plan.candidates.map((c) => c.kid);
+		const res = await manager.writeExportedJwksFile(absOutPath, allKids, plan);
+		log.success(
+			`Đã tạo mới và xuất ${res.keptCount} Public JWK chuẩn RFC 7517 ra file: ${pc.bold(absOutPath)}`,
+		);
+		return;
+	}
+
+	// File đích đã tồn tại -> Hiển thị Bảng đối chiếu Merge & Checkbox chọn khóa Giữ / Bỏ
+	note(
+		renderExportMergeTable(plan, absOutPath),
+		"Phát hiện file đã tồn tại — Bảng đối chiếu Merge JWKS",
+	);
+
+	if (plan.candidates.length === 0) {
+		log.warn("Không có khóa nào trong cả file đích lẫn Store để xuất.");
+		return;
+	}
+
+	const pickedKids = await multiselect({
+		message:
+			"Chọn các khóa muốn GIỮ LẠI trong file xuất ra (Dùng phím Space để Giữ/Bỏ, Enter để lưu):",
+		options: plan.candidates.map((c) => ({
+			value: c.kid,
+			label: `${c.kid} [${c.jwk.alg} / ${c.jwk.kty}]`,
+			hint:
+				c.source === "new_from_store"
+					? "+ Mới từ jwksctl Store"
+					: c.source === "both"
+						? "~ Trùng KID (Cập nhật bản chuẩn từ Store)"
+						: "○ Chỉ có ở file đích hiện tại (Bỏ tích nếu muốn loại bỏ)",
+		})),
+		initialValues: plan.candidates.map((c) => c.kid),
+		required: false,
+	});
+
+	if (isCancel(pickedKids)) {
+		cancel("Đã hủy thao tác Merge & Export.");
+		return;
+	}
+
+	const selectedKids = pickedKids as string[];
+	const res = await manager.writeExportedJwksFile(absOutPath, selectedKids, plan);
+
+	log.success(
+		`Đã Merge & xuất thành công ra file: ${pc.bold(absOutPath)} (Giữ lại: ${pc.green(String(res.keptCount))} khóa | Loại bỏ: ${pc.yellow(String(res.droppedCount))} khóa${
+			res.droppedKids.length > 0 ? ` [${res.droppedKids.join(", ")}]` : ""
+		})`,
+	);
+}
+
 export async function runInteractiveWizard(
 	manager: KeyManagerService,
 	defaultPassphrase?: string,
@@ -404,8 +508,7 @@ export async function runInteractiveWizard(
 		}
 
 		case "export": {
-			const exported = await manager.exportPublicJwks();
-			console.log(JSON.stringify(exported, null, 2));
+			await interactiveExportFlow(manager);
 			break;
 		}
 

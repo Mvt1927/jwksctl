@@ -16,12 +16,14 @@ import { KeyManagerService } from "../core/key-manager.ts";
 import { PemVault } from "../core/pem-vault.ts";
 import type { KeyStatus, SigningAlgorithm } from "../core/types.ts";
 import {
+	interactiveExportFlow,
 	interactiveRemoveFlow,
 	interactiveRestoreFlow,
 	interactiveTrashFlow,
 	runInteractiveWizard,
 } from "./interactive.ts";
 import {
+	renderExportMergeTable,
 	renderInspectReport,
 	renderIntegrityReport,
 	renderKeyTable,
@@ -589,52 +591,150 @@ export function buildCliProgram(): Command {
 			});
 		});
 
-	// 11. Lệnh export
+	// 11. Lệnh export (Kiểm tra file tồn tại & hiện Bảng Merge chọn khóa Giữ/Bỏ)
 	program
-		.command("export")
+		.command("export [file]")
 		.description(
-			"Trích xuất bộ Public JWKS chuẩn RFC 7517 thuần khiết (loại bỏ toàn bộ metadata nội bộ)",
+			"Trích xuất bộ Public JWKS chuẩn RFC 7517 ra file (nếu file đã tồn tại sẽ hiện Bảng Merge để chọn khóa giữ/bỏ)",
 		)
-		.option("-o, --output <file>", "Ghi kết quả ra file thay vì in ra màn hình (stdout)")
+		.option("-o, --output <file>", "Đường dẫn file đích muốn xuất (ví dụ: ./jwks.json)")
+		.option("--stdout", "Chỉ in kết quả ra màn hình (stdout) thay vì ghi ra file")
 		.option("--no-passive", "Chỉ xuất các khóa đang 'active', bỏ qua các khóa 'passive'")
 		.option("-f, --format <format>", "Định dạng xuất: json | pem", "json")
-		.action(async (opts: { output?: string; passive: boolean; format: string }) => {
-			const globalOpts = program.opts<GlobalCliOpts>();
-			await withManager(globalOpts, async (manager) => {
-				const payload = await manager.exportPublicJwks({
-					includePassive: opts.passive,
+		.option("--keep <kids>", "Danh sách kid muốn giữ lại khi Merge (cách nhau bằng dấu phẩy)")
+		.option("--drop <kids>", "Danh sách kid muốn loại bỏ khi Merge (cách nhau bằng dấu phẩy)")
+		.option("--overwrite", "Ghi đè toàn bộ bằng các khóa từ Store (bỏ khóa cũ chỉ có ở file đích)")
+		.option("-y, --yes", "Bỏ qua bảng hỏi Checkbox tương tác khi Merge")
+		.action(
+			async (
+				fileArg: string | undefined,
+				opts: {
+					output?: string;
+					stdout?: boolean;
+					passive: boolean;
+					format: string;
+					keep?: string;
+					drop?: string;
+					overwrite?: boolean;
+					yes?: boolean;
+				},
+			) => {
+				const globalOpts = program.opts<GlobalCliOpts>();
+				await withManager(globalOpts, async (manager) => {
+					if (opts.format.toLowerCase() === "pem") {
+						const payload = await manager.exportPublicJwks({
+							includePassive: opts.passive,
+						});
+						const pemBlocks: string[] = [];
+						for (const pubJwk of payload.keys) {
+							const spki = await exportPublicJwkToPem(pubJwk);
+							pemBlocks.push(`# KID: ${pubJwk.kid} (${pubJwk.alg})\n${spki.trim()}`);
+						}
+						const formattedOutput = `${pemBlocks.join("\n\n")}\n`;
+						const targetOut = fileArg ?? opts.output;
+						if (targetOut) {
+							const outPath = resolve(process.cwd(), targetOut);
+							await mkdir(dirname(outPath), { recursive: true });
+							await Bun.write(outPath, formattedOutput);
+							console.log(
+								`${pc.green("✓")} Đã xuất ${payload.keys.length} Public Key PEM ra file: ${pc.bold(outPath)}`,
+							);
+						} else {
+							process.stdout.write(formattedOutput);
+						}
+						return;
+					}
+
+					const cwdJwks = resolve(process.cwd(), "jwks.json");
+					const storeAbs = resolve(manager.adapter.location);
+					const defaultTtyFile = cwdJwks === storeAbs ? undefined : "./jwks.json";
+					const targetFile =
+						fileArg ??
+						opts.output ??
+						(!opts.stdout && !globalOpts.json && process.stdin.isTTY ? defaultTtyFile : undefined);
+
+					if (
+						!opts.stdout &&
+						!globalOpts.json &&
+						!opts.yes &&
+						!opts.keep &&
+						!opts.drop &&
+						!opts.overwrite &&
+						process.stdin.isTTY
+					) {
+						await interactiveExportFlow(manager, {
+							outputFile: targetFile,
+							includePassive: opts.passive,
+						});
+						return;
+					}
+
+					if (targetFile) {
+						const outPath = resolve(process.cwd(), targetFile);
+						const plan = await manager.prepareExportMergePlan(outPath, {
+							includePassive: opts.passive,
+						});
+
+						let selectedKids: string[];
+						if (opts.keep !== undefined) {
+							selectedKids = opts.keep
+								.split(",")
+								.map((s) => s.trim())
+								.filter(Boolean);
+						} else if (opts.overwrite) {
+							selectedKids = plan.candidates
+								.filter((c) => c.source !== "existing_only")
+								.map((c) => c.kid);
+						} else {
+							const dropSet = new Set(
+								(opts.drop ?? "")
+									.split(",")
+									.map((s) => s.trim())
+									.filter(Boolean),
+							);
+							selectedKids = plan.candidates.map((c) => c.kid).filter((kid) => !dropSet.has(kid));
+						}
+
+						const res = await manager.writeExportedJwksFile(outPath, selectedKids, plan);
+
+						if (globalOpts.json) {
+							console.log(
+								JSON.stringify(
+									{
+										exportedCount: res.keptCount,
+										keptCount: res.keptCount,
+										droppedCount: res.droppedCount,
+										droppedKids: res.droppedKids,
+										targetFileExistsBefore: plan.targetFileExists,
+										outputFile: outPath,
+										candidates: plan.candidates,
+									},
+									null,
+									2,
+								),
+							);
+						} else {
+							if (plan.targetFileExists) {
+								console.log(renderExportMergeTable(plan, outPath));
+								console.log(
+									`${pc.green("✓")} Đã Merge & xuất ${res.keptCount} Public JWK ra file: ${pc.bold(outPath)} (Giữ: ${res.keptCount}, Bỏ: ${res.droppedCount})`,
+								);
+							} else {
+								console.log(
+									`${pc.green("✓")} Đã xuất ${res.keptCount} Public JWK chuẩn RFC 7517 ra file: ${pc.bold(outPath)}`,
+								);
+							}
+						}
+						return;
+					}
+
+					const payload = await manager.exportPublicJwks({
+						includePassive: opts.passive,
+					});
+					process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
 				});
-
-				let formattedOutput: string;
-				if (opts.format.toLowerCase() === "pem") {
-					const pemBlocks: string[] = [];
-					for (const pubJwk of payload.keys) {
-						const spki = await exportPublicJwkToPem(pubJwk);
-						pemBlocks.push(`# KID: ${pubJwk.kid} (${pubJwk.alg})\n${spki.trim()}`);
-					}
-					formattedOutput = `${pemBlocks.join("\n\n")}\n`;
-				} else {
-					formattedOutput = `${JSON.stringify(payload, null, 2)}\n`;
-				}
-
-				if (opts.output) {
-					const outPath = resolve(opts.output);
-					await mkdir(dirname(outPath), { recursive: true });
-					await Bun.write(outPath, formattedOutput);
-					if (!globalOpts.json) {
-						console.log(
-							`${pc.green("✓")} Đã xuất ${payload.keys.length} Public JWK chuẩn RFC 7517 ra file: ${pc.bold(outPath)}`,
-						);
-					} else {
-						console.log(
-							JSON.stringify({ exportedCount: payload.keys.length, outputFile: outPath }, null, 2),
-						);
-					}
-				} else {
-					process.stdout.write(formattedOutput);
-				}
-			});
-		});
+			},
+		);
 
 	// 12. Lệnh import
 	program

@@ -1,6 +1,7 @@
 import pc from "picocolors";
 import {
 	isRecordExpired,
+	type ExportMergePlan,
 	type InspectKeyResult,
 	type IntegrityCheckReport,
 } from "../core/key-manager.ts";
@@ -195,4 +196,55 @@ export function renderTrashTable(items: readonly TrashItem[]): string {
 	});
 
 	return [headerLine, separator, ...rows].join("\n");
+}
+
+export function renderExportMergeTable(plan: ExportMergePlan, targetFilePath: string): string {
+	const lines: string[] = [];
+	lines.push(`${pc.bold("File đích đã tồn tại:")} ${pc.cyan(targetFilePath)}`);
+	lines.push(
+		`${pc.bold("Thống kê khóa:")}        Đang có ở file đích: ${pc.yellow(String(plan.existingCount))} | Từ jwksctl Store: ${pc.green(String(plan.storeCount))} | Tổng đối chiếu: ${pc.bold(String(plan.candidates.length))}`,
+	);
+	lines.push("");
+
+	if (plan.candidates.length === 0) {
+		lines.push(pc.dim("  (Không có khóa nào ở cả file đích lẫn Store)"));
+		return lines.join("\n");
+	}
+
+	const headers = [
+		{ label: "KID", width: 24 },
+		{ label: "ALG", width: 8 },
+		{ label: "KTY", width: 6 },
+		{ label: "NGUỒN ĐỐI CHIẾU (MERGE SOURCE)", width: 34 },
+		{ label: "STATUS TRONG STORE", width: 20 },
+	];
+
+	const headerLine = headers.map((h) => padRight(pc.bold(pc.cyan(h.label)), h.width)).join("  ");
+	const separator = headers.map((h) => pc.dim("─".repeat(h.width))).join("──");
+	lines.push(headerLine, separator);
+
+	for (const c of plan.candidates) {
+		const sourceDisplay =
+			c.source === "new_from_store"
+				? pc.green("+ Mới từ jwksctl Store")
+				: c.source === "both"
+					? pc.yellow("~ Trùng KID (Có ở cả 2 bên)")
+					: pc.cyan("○ Chỉ có ở file đích hiện tại");
+
+		const statusDisplay = c.storeStatus
+			? formatStatusBadge(c.storeStatus)
+			: pc.dim("- (ngoài Store)");
+
+		lines.push(
+			[
+				padRight(pc.bold(c.kid), headers[0]!.width),
+				padRight(c.jwk.alg, headers[1]!.width),
+				padRight(c.jwk.kty, headers[2]!.width),
+				padRight(sourceDisplay, headers[3]!.width),
+				padRight(statusDisplay, headers[4]!.width),
+			].join("  "),
+		);
+	}
+
+	return lines.join("\n");
 }
