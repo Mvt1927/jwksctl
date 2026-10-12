@@ -1,6 +1,33 @@
 {
 	"name": "jwksctl",
 	"version": "1.0.0",
+	"description": "Production-grade CLI for JWKS lifecycle management, key rotation, signing, and verification",
+	"author": "Mvt1927",
+	"license": "MIT",
+	"keywords": [
+		"jwks",
+		"jwt",
+		"crypto",
+		"security",
+		"key-rotation",
+		"rfc7517",
+		"cli",
+		"bun"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Mvt1927/jwksctl.git"
+	},
+	"bugs": {
+		"url": "https://github.com/Mvt1927/jwksctl/issues"
+	},
+	"homepage": "https://github.com/Mvt1927/jwksctl#readme",
+	"files": [
+		"src",
+		"index.ts",
+		"README.md",
+		"install.sh"
+	],
 	"module": "index.ts",
 	"type": "module",
 	"bin": {
@@ -23,7 +50,6 @@
 		"format:check": "prettier --check .",
 		"prepare": "husky"
 	},
-	"private": true,
 	"devDependencies": {
 		"@eslint/js": "^10.0.1",
 		"@types/bun": "latest",
