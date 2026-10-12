@@ -66,8 +66,7 @@ export async function encryptPemContent(pkcs8Pem: string, passphrase: string): P
 }
 
 export async function decryptPemContent(content: string, passphrase?: string): Promise<string> {
-	const trimmed = content.trim();
-	if (!trimmed.startsWith(ENCRYPTED_HEADER)) {
+	if (!content.includes(ENCRYPTED_HEADER)) {
 		return content;
 	}
 	if (!passphrase) {
@@ -76,7 +75,12 @@ export async function decryptPemContent(content: string, passphrase?: string): P
 		);
 	}
 
-	const base64Body = trimmed
+	const match = content.match(new RegExp(`${ENCRYPTED_HEADER}[\\s\\S]*?${ENCRYPTED_FOOTER}`));
+	if (!match) {
+		return content;
+	}
+
+	const base64Body = match[0]
 		.replace(ENCRYPTED_HEADER, "")
 		.replace(ENCRYPTED_FOOTER, "")
 		.replace(/\s+/g, "");
@@ -119,6 +123,10 @@ export class PemVault {
 		this.trashManifestPath = resolve(join(this.trashDir, "manifest.json"));
 	}
 
+	get defaultKeysDir(): string {
+		return this.baseKeysDir;
+	}
+
 	/**
 	 * Phân giải đường dẫn file .pem tương đối dựa trên thư mục gốc cài đặt (vaultRootDir)
 	 * để chạy từ bất kỳ thư mục nào cũng tìm đúng file .pem.
@@ -144,17 +152,42 @@ export class PemVault {
 		kid: string,
 		pkcs8Pem: string,
 		passphrase?: string,
+		customTarget?: string,
+		publicPem?: string,
 	): Promise<{ privateKeyPath: string; isEncrypted: boolean }> {
-		const filePath = this.getKeyFilePath(kid);
+		const safeKid = kid.replace(/[^a-zA-Z0-9._-]/g, "_");
+		let filePath: string;
+		const trimmedTarget = customTarget?.trim();
+
+		if (
+			!trimmedTarget ||
+			trimmedTarget.toLowerCase() === "default" ||
+			resolve(process.cwd(), trimmedTarget) === resolve(this.baseKeysDir)
+		) {
+			filePath = this.getKeyFilePath(kid);
+		} else {
+			const resolvedTarget = isAbsolute(trimmedTarget)
+				? resolve(trimmedTarget)
+				: resolve(process.cwd(), trimmedTarget);
+			if (trimmedTarget.toLowerCase().endsWith(".pem")) {
+				filePath = resolvedTarget;
+			} else {
+				filePath = join(resolvedTarget, `${safeKid}.pem`);
+			}
+		}
+
 		const absPath = this.resolveKeyPath(filePath);
 		await mkdir(dirname(absPath), { recursive: true });
 
 		const isEncrypted = Boolean(passphrase && passphrase.length > 0);
-		const contentToWrite = isEncrypted
+		const privateContent = isEncrypted
 			? await encryptPemContent(pkcs8Pem, passphrase!)
 			: pkcs8Pem.endsWith("\n")
 				? pkcs8Pem
 				: `${pkcs8Pem}\n`;
+
+		// Nếu có publicPem, ghi Public Key SPKI lên đầu file .pem (Bundle cả 2 khóa)
+		const contentToWrite = publicPem ? `${publicPem.trim()}\n\n${privateContent}` : privateContent;
 
 		const tmpPath = `${absPath}.tmp.${process.pid}.${Date.now()}`;
 		await Bun.write(tmpPath, contentToWrite);
@@ -192,6 +225,21 @@ export class PemVault {
 		}
 		await rm(absPath, { force: true });
 		return true;
+	}
+
+	async renamePrivateKey(oldPrivateKeyPath: string, newKid: string): Promise<string> {
+		const safeKid = newKid.replace(/[^a-zA-Z0-9._-]/g, "_");
+		const newFilePath = isAbsolute(oldPrivateKeyPath)
+			? join(dirname(oldPrivateKeyPath), `${safeKid}.pem`).replace(/\\/g, "/")
+			: join(dirname(oldPrivateKeyPath), `${safeKid}.pem`).replace(/\\/g, "/");
+		const srcAbs = this.resolveKeyPath(oldPrivateKeyPath);
+		const destAbs = this.resolveKeyPath(newFilePath);
+		if (srcAbs !== destAbs && (await this.exists(srcAbs))) {
+			await mkdir(dirname(destAbs), { recursive: true });
+			await copyFile(srcAbs, destAbs);
+			await rm(srcAbs, { force: true });
+		}
+		return newFilePath;
 	}
 
 	private async readTrashManifest(): Promise<TrashItem[]> {

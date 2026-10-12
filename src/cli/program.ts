@@ -1,3 +1,4 @@
+import { confirm, isCancel, select, text } from "@clack/prompts";
 import { Command } from "commander";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -16,10 +17,20 @@ import { KeyManagerService } from "../core/key-manager.ts";
 import { PemVault } from "../core/pem-vault.ts";
 import type { KeyStatus, SigningAlgorithm } from "../core/types.ts";
 import {
+	interactiveEditFlow,
 	interactiveExportFlow,
+	interactiveGenerateFlow,
+	interactiveImportFlow,
+	interactiveInspectFlow,
+	interactiveListFlow,
+	interactivePruneFlow,
 	interactiveRemoveFlow,
 	interactiveRestoreFlow,
+	interactiveRotateFlow,
+	interactiveSignFlow,
+	interactiveTrashEmptyFlow,
 	interactiveTrashFlow,
+	interactiveVerifyFlow,
 	runInteractiveWizard,
 } from "./interactive.ts";
 import {
@@ -35,6 +46,11 @@ interface GlobalCliOpts extends RuntimeOptions {
 	config?: string;
 	table?: string;
 	json?: boolean;
+	yes?: boolean;
+}
+
+function shouldShowPrompts(cmdYes: boolean | undefined, globalOpts: GlobalCliOpts): boolean {
+	return !cmdYes && !globalOpts.yes && !globalOpts.json && Boolean(process.stdin.isTTY);
 }
 
 async function withManager<T>(
@@ -74,6 +90,7 @@ export function buildCliProgram(): Command {
 		.option("-t, --table <name>", "Tên bảng trong Database (mặc định: jwks_keys)")
 		.option("--passphrase <secret>", "Passphrase mã hóa/giải mã AES-256-GCM cho file .pem")
 		.option("--config <path>", "Đường dẫn tới file cấu hình .jwksctl.json", DEFAULT_CONFIG_FILE)
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác, dùng thẳng giá trị mặc định")
 		.option("--json", "Xuất kết quả dưới định dạng JSON");
 
 	// 1. Lệnh init
@@ -81,21 +98,81 @@ export function buildCliProgram(): Command {
 		.command("init")
 		.description("Khởi tạo Store (jwks.json hoặc bảng Database) và thư mục lưu file .pem")
 		.option("--save-profile <name>", "Lưu cấu hình hiện tại thành một profile trong .jwksctl.json")
-		.action(async (cmdOpts: { saveProfile?: string }) => {
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác")
+		.action(async (cmdOpts: { saveProfile?: string; yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
-			await withManager(globalOpts, async (manager, ctx) => {
-				await manager.initStore();
-				await mkdir(resolve(ctx.profile.keysDir), { recursive: true });
+			const ctx = await resolveRuntimeContext({
+				...globalOpts,
+				configPath: globalOpts.config ?? globalOpts.configPath,
+				tableName: globalOpts.table ?? globalOpts.tableName,
+			});
 
-				if (cmdOpts.saveProfile) {
+			let storeUri = ctx.profile.uri;
+			let keysDir = ctx.profile.keysDir;
+			let saveProfile = cmdOpts.saveProfile;
+
+			if (shouldShowPrompts(cmdOpts.yes, globalOpts)) {
+				const enteredStore = await text({
+					message:
+						"Đường dẫn Store (file jwks.json, SQLite hoặc Database URI) [Enter dùng mặc định, 'back' để hủy]:",
+					initialValue: storeUri,
+					defaultValue: storeUri,
+					placeholder: storeUri,
+				});
+				if (isCancel(enteredStore) || String(enteredStore).trim().toLowerCase() === "back") {
+					return;
+				}
+				storeUri = String(enteredStore || storeUri).trim();
+
+				const enteredKeysDir = await text({
+					message: "Thư mục lưu file Private Key (.pem) [Enter dùng mặc định, 'back' để hủy]:",
+					initialValue: keysDir,
+					defaultValue: keysDir,
+					placeholder: keysDir,
+				});
+				if (isCancel(enteredKeysDir) || String(enteredKeysDir).trim().toLowerCase() === "back") {
+					return;
+				}
+				keysDir = String(enteredKeysDir || keysDir).trim();
+
+				const defaultProfilePrompt = saveProfile ?? "none";
+				const enteredProfile = await text({
+					message:
+						"Lưu cấu hình thành Profile trong .jwksctl.json [Mặc định: 'none' = không lưu, hoặc nhập tên profile]:",
+					initialValue: defaultProfilePrompt,
+					defaultValue: defaultProfilePrompt,
+					placeholder: defaultProfilePrompt,
+				});
+				if (isCancel(enteredProfile) || String(enteredProfile).trim().toLowerCase() === "back") {
+					return;
+				}
+				const profVal = String(enteredProfile || defaultProfilePrompt).trim();
+				saveProfile = profVal.toLowerCase() === "none" || !profVal ? undefined : profVal;
+			}
+
+			const finalProfile = {
+				...ctx.profile,
+				type: detectStoreType(storeUri),
+				uri: storeUri,
+				keysDir,
+			};
+			const adapter = createStorageAdapter(finalProfile);
+			const vault = new PemVault(finalProfile.keysDir);
+			const manager = new KeyManagerService(adapter, vault);
+
+			try {
+				await manager.initStore();
+				await mkdir(resolve(finalProfile.keysDir), { recursive: true });
+
+				if (saveProfile) {
 					const cfgPath = globalOpts.config ?? DEFAULT_CONFIG_FILE;
 					const existing = (await loadConfigFile(cfgPath)) ?? {
-						defaultProfile: cmdOpts.saveProfile,
+						defaultProfile: saveProfile,
 						profiles: {},
 					};
-					existing.profiles[cmdOpts.saveProfile] = ctx.profile;
+					existing.profiles[saveProfile] = finalProfile;
 					if (!existing.defaultProfile) {
-						existing.defaultProfile = cmdOpts.saveProfile;
+						existing.defaultProfile = saveProfile;
 					}
 					await saveConfigFile(existing, cfgPath);
 				}
@@ -105,10 +182,10 @@ export function buildCliProgram(): Command {
 						JSON.stringify(
 							{
 								initialized: true,
-								profile: cmdOpts.saveProfile ?? ctx.profileName,
-								storeType: ctx.profile.type,
+								profile: saveProfile ?? ctx.profileName,
+								storeType: finalProfile.type,
 								location: manager.adapter.location,
-								keysDir: resolve(ctx.profile.keysDir),
+								keysDir: resolve(finalProfile.keysDir),
 							},
 							null,
 							2,
@@ -116,18 +193,20 @@ export function buildCliProgram(): Command {
 					);
 				} else {
 					console.log(
-						`${pc.green("✓")} Đã khởi tạo Store (${pc.cyan(ctx.profile.type)}) tại: ${pc.bold(manager.adapter.location)}`,
+						`${pc.green("✓")} Đã khởi tạo Store (${pc.cyan(finalProfile.type)}) tại: ${pc.bold(manager.adapter.location)}`,
 					);
 					console.log(
-						`${pc.green("✓")} Thư mục Private Key (.pem): ${pc.bold(resolve(ctx.profile.keysDir))}`,
+						`${pc.green("✓")} Thư mục Private Key (.pem): ${pc.bold(resolve(finalProfile.keysDir))}`,
 					);
-					if (cmdOpts.saveProfile) {
+					if (saveProfile) {
 						console.log(
-							`${pc.green("✓")} Đã lưu profile "${pc.cyan(cmdOpts.saveProfile)}" vào ${globalOpts.config ?? DEFAULT_CONFIG_FILE}`,
+							`${pc.green("✓")} Đã lưu profile "${pc.cyan(saveProfile)}" vào ${globalOpts.config ?? DEFAULT_CONFIG_FILE}`,
 						);
 					}
 				}
-			});
+			} finally {
+				await adapter.close?.();
+			}
 		});
 
 	// 2. Nhóm lệnh config (quản lý Profile/Context)
@@ -136,18 +215,88 @@ export function buildCliProgram(): Command {
 		.description("Quản lý các Profile kết nối trong file .jwksctl.json");
 
 	configCmd
-		.command("set <profileName>")
+		.command("set [profileName]")
 		.description("Thêm hoặc cập nhật một Profile kết nối")
-		.requiredOption("--store <uri>", "Đường dẫn file hoặc URI kết nối Database")
+		.option("--store <uri>", "Đường dẫn file hoặc URI kết nối Database")
 		.option("--keys-dir <dir>", "Thư mục lưu file Private Key (.pem)", "./keys")
 		.option("--table <name>", "Tên bảng Database", "jwks_keys")
 		.option("--default", "Đặt làm profile mặc định")
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác")
 		.action(
 			async (
-				profileName: string,
-				opts: { store: string; keysDir: string; table: string; default?: boolean },
+				profileNameArg: string | undefined,
+				opts: {
+					store?: string;
+					keysDir: string;
+					table: string;
+					default?: boolean;
+					yes?: boolean;
+				},
 			) => {
 				const globalOpts = program.opts<GlobalCliOpts>();
+				let profileName = profileNameArg ?? "default";
+				let storeUri = opts.store ?? "./jwks.json";
+				let keysDir = opts.keysDir ?? "./keys";
+				let tableName = opts.table ?? "jwks_keys";
+				let setDefault = Boolean(opts.default);
+
+				if (shouldShowPrompts(opts.yes, globalOpts)) {
+					const pName = await text({
+						message: "Tên Profile kết nối (gõ 'back' để hủy):",
+						initialValue: profileName,
+						defaultValue: profileName,
+						placeholder: profileName,
+					});
+					if (isCancel(pName) || String(pName).trim().toLowerCase() === "back") {
+						return;
+					}
+					profileName = String(pName || profileName).trim();
+
+					const sUri = await text({
+						message: "Đường dẫn file jwks.json hoặc Database URI:",
+						initialValue: storeUri,
+						defaultValue: storeUri,
+						placeholder: storeUri,
+					});
+					if (isCancel(sUri) || String(sUri).trim().toLowerCase() === "back") {
+						return;
+					}
+					storeUri = String(sUri || storeUri).trim();
+
+					const kDir = await text({
+						message: "Thư mục lưu file Private Key (.pem):",
+						initialValue: keysDir,
+						defaultValue: keysDir,
+						placeholder: keysDir,
+					});
+					if (isCancel(kDir) || String(kDir).trim().toLowerCase() === "back") {
+						return;
+					}
+					keysDir = String(kDir || keysDir).trim();
+
+					const tName = await text({
+						message: "Tên bảng Database (nếu dùng DB):",
+						initialValue: tableName,
+						defaultValue: tableName,
+						placeholder: tableName,
+					});
+					if (isCancel(tName) || String(tName).trim().toLowerCase() === "back") {
+						return;
+					}
+					tableName = String(tName || tableName).trim();
+
+					const defConfirm = await confirm({
+						message: `Đặt "${profileName}" làm profile mặc định?`,
+						initialValue: opts.default ?? true,
+					});
+					if (isCancel(defConfirm)) {
+						return;
+					}
+					setDefault = defConfirm;
+				} else if (!opts.store) {
+					throw new Error("Vui lòng truyền --store <uri> khi chạy config set với cờ -y.");
+				}
+
 				const cfgPath = globalOpts.config ?? DEFAULT_CONFIG_FILE;
 				const cfg = (await loadConfigFile(cfgPath)) ?? {
 					defaultProfile: profileName,
@@ -155,12 +304,12 @@ export function buildCliProgram(): Command {
 				};
 
 				cfg.profiles[profileName] = {
-					type: detectStoreType(opts.store),
-					uri: opts.store,
-					keysDir: opts.keysDir,
-					tableName: opts.table,
+					type: detectStoreType(storeUri),
+					uri: storeUri,
+					keysDir,
+					tableName,
 				};
-				if (opts.default || !cfg.defaultProfile) {
+				if (setDefault || !cfg.defaultProfile) {
 					cfg.defaultProfile = profileName;
 				}
 				await saveConfigFile(cfg, cfgPath);
@@ -169,25 +318,49 @@ export function buildCliProgram(): Command {
 					console.log(JSON.stringify(cfg, null, 2));
 				} else {
 					console.log(
-						`${pc.green("✓")} Đã lưu profile "${pc.cyan(profileName)}" (${cfg.profiles[profileName]!.type}: ${opts.store}). Mặc định: ${pc.bold(cfg.defaultProfile)}`,
+						`${pc.green("✓")} Đã lưu profile "${pc.cyan(profileName)}" (${cfg.profiles[profileName]!.type}: ${storeUri}). Mặc định: ${pc.bold(cfg.defaultProfile)}`,
 					);
 				}
 			},
 		);
 
 	configCmd
-		.command("use <profileName>")
+		.command("use [profileName]")
 		.description("Chuyển đổi Profile mặc định")
-		.action(async (profileName: string) => {
+		.option("-y, --yes", "Bỏ qua bước chọn tương tác")
+		.action(async (profileNameArg: string | undefined, opts: { yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
 			const cfgPath = globalOpts.config ?? DEFAULT_CONFIG_FILE;
 			const cfg = await loadConfigFile(cfgPath);
-			if (!cfg || !cfg.profiles[profileName]) {
-				throw new Error(`Không tìm thấy profile "${profileName}" trong ${cfgPath}.`);
+			if (!cfg || Object.keys(cfg.profiles).length === 0) {
+				throw new Error(`Chưa có profile nào trong ${cfgPath}.`);
 			}
-			cfg.defaultProfile = profileName;
+
+			let targetProfile = profileNameArg ?? cfg.defaultProfile ?? Object.keys(cfg.profiles)[0]!;
+			if (shouldShowPrompts(opts.yes, globalOpts)) {
+				const chosen = await select({
+					message: "Chọn Profile muốn đặt làm mặc định:",
+					options: [
+						...Object.entries(cfg.profiles).map(([name, p]) => ({
+							value: name,
+							label: `${name} (${p.type}: ${p.uri})${name === cfg.defaultProfile ? " — Đang mặc định" : ""}`,
+						})),
+						{ value: "__back__", label: "⬅️  Quay lại (Back)" },
+					],
+					initialValue: targetProfile,
+				});
+				if (isCancel(chosen) || chosen === "__back__") {
+					return;
+				}
+				targetProfile = String(chosen);
+			}
+
+			if (!cfg.profiles[targetProfile]) {
+				throw new Error(`Không tìm thấy profile "${targetProfile}" trong ${cfgPath}.`);
+			}
+			cfg.defaultProfile = targetProfile;
 			await saveConfigFile(cfg, cfgPath);
-			console.log(`${pc.green("✓")} Đã chuyển profile mặc định sang "${pc.cyan(profileName)}".`);
+			console.log(`${pc.green("✓")} Đã chuyển profile mặc định sang "${pc.cyan(targetProfile)}".`);
 		});
 
 	configCmd
@@ -223,6 +396,12 @@ export function buildCliProgram(): Command {
 		.option("--bits <number>", "Độ dài khóa RSA (2048, 3072, 4096)", "2048")
 		.option("--status <status>", "Trạng thái ban đầu (active | passive)", "active")
 		.option("--expires-in <duration>", "Thời hạn hiệu lực (ví dụ: 30d, 24h)")
+		.option("-o, --output <path>", "Thư mục hoặc đường dẫn file lưu Private Key (.pem)")
+		.option(
+			"-P, --output-public <path>",
+			"Đường dẫn file lưu Public Key (.pem cho SPKI, .json cho JWK)",
+		)
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác, tạo ngay với giá trị mặc định")
 		.action(
 			async (opts: {
 				alg: string;
@@ -230,41 +409,70 @@ export function buildCliProgram(): Command {
 				bits: string;
 				status: string;
 				expiresIn?: string;
+				output?: string;
+				outputPublic?: string;
+				yes?: boolean;
 			}) => {
 				const globalOpts = program.opts<GlobalCliOpts>();
 				await withManager(globalOpts, async (manager, ctx) => {
+					if (shouldShowPrompts(opts.yes, globalOpts)) {
+						await interactiveGenerateFlow(manager, {
+							alg: opts.alg as SigningAlgorithm,
+							kid: opts.kid,
+							bits: Number(opts.bits),
+							status: opts.status as KeyStatus,
+							expiresIn: opts.expiresIn,
+							outputPem: opts.output ?? globalOpts.keysDir,
+							outputPublic: opts.outputPublic,
+							passphrase: ctx.passphrase,
+						});
+						return;
+					}
+
 					await manager.initStore();
-					const { record, diff } = await manager.generateKey({
+					const { record, diff, publicFilePath } = await manager.generateKey({
 						alg: opts.alg as SigningAlgorithm,
 						kid: opts.kid,
 						modulusLength: Number(opts.bits),
 						status: opts.status as KeyStatus,
 						expiresIn: opts.expiresIn,
+						outputPem: opts.output,
+						outputPublic: opts.outputPublic,
 						passphrase: ctx.passphrase,
 					});
 
 					if (globalOpts.json) {
-						console.log(JSON.stringify({ record, diff }, null, 2));
+						console.log(JSON.stringify({ record, diff, publicFilePath }, null, 2));
 					} else {
 						console.log(
 							`${pc.green("✓")} Đã tạo khóa mới: ${pc.bold(pc.cyan(record.kid))} (${record.alg})`,
 						);
 						console.log(`  Private Key (.pem): ${pc.bold(record.privateKeyPath)}`);
+						if (publicFilePath) {
+							console.log(`  Public Key: ${pc.bold(pc.green(publicFilePath))}`);
+						}
 						console.log(renderMutationDiff(diff));
 					}
 				});
 			},
 		);
 
-	// 4. Lệnh list
+	// 4. Lệnh list (Hiển thị bảng khóa kèm menu Sửa / Xóa tương tác)
 	program
 		.command("list")
 		.alias("ls")
-		.description("Liệt kê danh sách các khóa trong Store")
+		.description("Liệt kê danh sách các khóa trong Store (hỗ trợ thao tác Sửa / Xóa trực tiếp)")
 		.option("--status <status>", "Lọc theo trạng thái (active | passive | revoked)")
-		.action(async (opts: { status?: string }) => {
+		.option("--plain", "Chỉ in bảng danh sách khóa mà không mở menu Sửa / Xóa")
+		.option("-y, --yes", "Chỉ in bảng danh sách khóa mà không mở menu tương tác")
+		.action(async (opts: { status?: string; plain?: boolean; yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
 			await withManager(globalOpts, async (manager) => {
+				if (!opts.plain && shouldShowPrompts(opts.yes, globalOpts)) {
+					await interactiveListFlow(manager, opts.status as KeyStatus | undefined);
+					return;
+				}
+
 				const records = await manager.listKeys({
 					status: opts.status as KeyStatus | undefined,
 				});
@@ -282,15 +490,87 @@ export function buildCliProgram(): Command {
 			});
 		});
 
+	// 4b. Lệnh edit (Sửa thông tin khóa)
+	program
+		.command("edit [kid]")
+		.description(
+			"Chỉnh sửa thông tin khóa (đổi kid kèm tên file .pem, đổi trạng thái status, đặt/xóa hạn dùng expiresAt)",
+		)
+		.option("--new-kid <kid>", "Mã định danh khóa (kid) mới")
+		.option("--status <status>", "Trạng thái mới (active | passive | revoked)")
+		.option("--expires-in <duration>", "Đặt thời hạn hiệu lực mới (ví dụ: 7d, 30d, 24h)")
+		.option("--clear-expiry", "Xóa giới hạn thời gian hết hạn")
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác")
+		.action(
+			async (
+				kid: string | undefined,
+				opts: {
+					newKid?: string;
+					status?: string;
+					expiresIn?: string;
+					clearExpiry?: boolean;
+					yes?: boolean;
+				},
+			) => {
+				const globalOpts = program.opts<GlobalCliOpts>();
+				await withManager(globalOpts, async (manager) => {
+					if (shouldShowPrompts(opts.yes, globalOpts)) {
+						await interactiveEditFlow(manager, kid, {
+							newKid: opts.newKid,
+							status: opts.status as KeyStatus | undefined,
+							expiresIn: opts.expiresIn,
+							clearExpiry: opts.clearExpiry,
+						});
+						return;
+					}
+
+					if (!kid) {
+						throw new Error("Vui lòng truyền mã khóa <kid> cần sửa khi dùng cờ -y.");
+					}
+
+					const { record, diff } = await manager.editKey(kid, {
+						newKid: opts.newKid,
+						status: opts.status as KeyStatus | undefined,
+						expiresIn: opts.expiresIn,
+						clearExpiry: Boolean(opts.clearExpiry),
+					});
+
+					if (globalOpts.json) {
+						console.log(JSON.stringify({ record, diff }, null, 2));
+					} else {
+						console.log(renderMutationDiff(diff));
+						console.log(
+							`${pc.green("✓")} Đã cập nhật khóa: ${pc.bold(pc.cyan(record.kid))} (status=${record.status}, pem=${record.privateKeyPath})`,
+						);
+					}
+				});
+			},
+		);
+
 	// 5. Lệnh inspect
 	program
-		.command("inspect <kid>")
+		.command("inspect [kid]")
 		.description("Xem chi tiết một khóa, kiểm tra file .pem và hiển thị Public Key SPKI PEM")
 		.option("--pem-only", "Chỉ xuất chuỗi Public Key PEM")
-		.action(async (kid: string, opts: { pemOnly?: boolean }) => {
+		.option("-y, --yes", "Bỏ qua bước chọn khóa tương tác")
+		.action(async (kid: string | undefined, opts: { pemOnly?: boolean; yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
 			await withManager(globalOpts, async (manager) => {
-				const info = await manager.inspectKey(kid);
+				if (!opts.pemOnly && shouldShowPrompts(opts.yes, globalOpts)) {
+					await interactiveInspectFlow(manager, kid);
+					return;
+				}
+
+				let targetKid = kid;
+				if (!targetKid) {
+					const keys = await manager.listKeys();
+					targetKid = keys.find((k) => k.status === "active")?.kid ?? keys[0]?.kid;
+					if (!targetKid) {
+						throw new Error("Kho lưu trữ hiện đang trống, không có khóa nào để inspect.");
+					}
+				}
+
+				const info = await manager.inspectKey(targetKid);
 				if (opts.pemOnly) {
 					process.stdout.write(info.publicPem);
 					return;
@@ -313,33 +593,62 @@ export function buildCliProgram(): Command {
 		.option("--kid <id>", "Mã định danh (kid) cho khóa mới")
 		.option("--bits <number>", "Độ dài khóa RSA (mặc định: 2048)", "2048")
 		.option("-g, --grace-period <duration>", "Thời gian ân hạn cho khóa cũ (ví dụ: 7d, 24h)", "7d")
+		.option("-o, --output <path>", "Thư mục hoặc đường dẫn file lưu Private Key (.pem) mới")
+		.option(
+			"-P, --output-public <path>",
+			"Đường dẫn file lưu Public Key (.pem cho SPKI, .json cho JWK)",
+		)
 		.option("--revoke-old", "Thu hồi (revoked) ngay lập tức khóa cũ thay vì chuyển sang passive")
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác, xoay vòng ngay với giá trị mặc định")
 		.action(
 			async (opts: {
 				alg?: string;
 				kid?: string;
 				bits: string;
 				gracePeriod: string;
+				output?: string;
+				outputPublic?: string;
 				revokeOld?: boolean;
+				yes?: boolean;
 			}) => {
 				const globalOpts = program.opts<GlobalCliOpts>();
 				await withManager(globalOpts, async (manager, ctx) => {
+					if (shouldShowPrompts(opts.yes, globalOpts)) {
+						await interactiveRotateFlow(manager, {
+							alg: opts.alg as SigningAlgorithm | undefined,
+							kid: opts.kid,
+							bits: Number(opts.bits),
+							gracePeriod: opts.gracePeriod,
+							outputPem: opts.output ?? globalOpts.keysDir,
+							outputPublic: opts.outputPublic,
+							revokeOld: Boolean(opts.revokeOld),
+							passphrase: ctx.passphrase,
+						});
+						return;
+					}
+
 					await manager.initStore();
-					const { newRecord, demotedKids, diff } = await manager.rotateKeys({
+					const { newRecord, demotedKids, diff, publicFilePath } = await manager.rotateKeys({
 						alg: opts.alg as SigningAlgorithm | undefined,
 						kid: opts.kid,
 						modulusLength: Number(opts.bits),
 						gracePeriod: opts.gracePeriod,
+						outputPem: opts.output,
+						outputPublic: opts.outputPublic,
 						revokeOldImmediately: Boolean(opts.revokeOld),
 						passphrase: ctx.passphrase,
 					});
 
 					if (globalOpts.json) {
-						console.log(JSON.stringify({ newRecord, demotedKids, diff }, null, 2));
+						console.log(JSON.stringify({ newRecord, demotedKids, diff, publicFilePath }, null, 2));
 					} else {
 						console.log(
 							`${pc.green("✓")} Đã xoay vòng khóa thành công! Khóa active mới: ${pc.bold(pc.cyan(newRecord.kid))}`,
 						);
+						console.log(`  Private Key (.pem) mới: ${pc.bold(newRecord.privateKeyPath)}`);
+						if (publicFilePath) {
+							console.log(`  Public Key: ${pc.bold(pc.green(publicFilePath))}`);
+						}
 						if (demotedKids.length > 0) {
 							console.log(
 								`  Khóa cũ chuyển sang ${opts.revokeOld ? pc.red("revoked") : pc.yellow(`passive (ân hạn ${opts.gracePeriod})`)}: ${demotedKids.join(", ")}`,
@@ -378,14 +687,15 @@ export function buildCliProgram(): Command {
 				const isPermanent = Boolean(opts.permanent || opts.deletePem);
 
 				await withManager(globalOpts, async (manager) => {
-					if (parsedKids.length === 0 || (!opts.yes && !globalOpts.json && process.stdin.isTTY)) {
-						if (parsedKids.length === 0 && !process.stdin.isTTY) {
-							throw new Error(
-								"Vui lòng truyền ít nhất 1 mã khóa (kid) cần xóa khi chạy ở chế độ non-interactive.",
-							);
-						}
+					if (shouldShowPrompts(opts.yes, globalOpts)) {
 						await interactiveRemoveFlow(manager, parsedKids, opts.force, isPermanent);
 						return;
+					}
+
+					if (parsedKids.length === 0) {
+						throw new Error(
+							"Vui lòng truyền ít nhất 1 mã khóa (kid) cần xóa khi dùng cờ -y / non-interactive.",
+						);
 					}
 
 					const { diff, trashedItems, deletedPemPaths } = await manager.removeKeys(parsedKids, {
@@ -423,10 +733,16 @@ export function buildCliProgram(): Command {
 		.description("Dọn dẹp tự động các khóa đã bị thu hồi (revoked) hoặc passive đã hết hạn")
 		.option("--permanent", "Xóa vĩnh viễn các file Private Key (.pem) thay vì đưa vào Thùng rác")
 		.option("--delete-pem", "Tương đương --permanent")
-		.action(async (opts: { permanent?: boolean; deletePem?: boolean }) => {
+		.option("-y, --yes", "Bỏ qua các bước hỏi xác nhận tương tác")
+		.action(async (opts: { permanent?: boolean; deletePem?: boolean; yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
 			const isPermanent = Boolean(opts.permanent || opts.deletePem);
 			await withManager(globalOpts, async (manager) => {
+				if (shouldShowPrompts(opts.yes, globalOpts)) {
+					await interactivePruneFlow(manager, isPermanent);
+					return;
+				}
+
 				const result = await manager.pruneKeys({
 					permanent: isPermanent,
 				});
@@ -466,15 +782,8 @@ export function buildCliProgram(): Command {
 					.filter(Boolean);
 
 				await withManager(globalOpts, async (manager) => {
-					if (
-						!opts.fromBak &&
-						!opts.all &&
-						parsedKids.length === 0 &&
-						!opts.yes &&
-						!globalOpts.json &&
-						process.stdin.isTTY
-					) {
-						await interactiveRestoreFlow(manager);
+					if (!opts.fromBak && shouldShowPrompts(opts.yes, globalOpts)) {
+						await interactiveRestoreFlow(manager, parsedKids);
 						return;
 					}
 
@@ -512,14 +821,15 @@ export function buildCliProgram(): Command {
 			},
 		);
 
-	// 9b. Nhóm lệnh trash (Quản lý Thùng rác ./keys/.trash)
+	// 9b. Nhóm lệnh trash (Quản lý Thùng rác)
 	const trashCmd = program
 		.command("trash")
-		.description("Quản lý Thùng rác chứa các khóa và file .pem đã xóa (./keys/.trash)")
-		.action(async () => {
+		.description("Quản lý Thùng rác chứa các khóa và file .pem đã xóa (.trash)")
+		.option("-y, --yes", "Chỉ hiển thị danh sách Thùng rác mà không mở menu tương tác")
+		.action(async (opts: { yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
 			await withManager(globalOpts, async (manager) => {
-				if (!globalOpts.json && process.stdin.isTTY) {
+				if (shouldShowPrompts(opts.yes, globalOpts)) {
 					await interactiveTrashFlow(manager);
 					return;
 				}
@@ -551,7 +861,8 @@ export function buildCliProgram(): Command {
 	trashCmd
 		.command("empty [kids...]")
 		.description("Dọn sạch vĩnh viễn toàn bộ (hoặc một số kid) trong Thùng rác")
-		.action(async (rawKids: string[]) => {
+		.option("-y, --yes", "Bỏ qua bước chọn và xác nhận tương tác")
+		.action(async (rawKids: string[], opts: { yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
 			const parsedKids = rawKids
 				.flatMap((item) => item.split(","))
@@ -559,6 +870,11 @@ export function buildCliProgram(): Command {
 				.filter(Boolean);
 
 			await withManager(globalOpts, async (manager) => {
+				if (shouldShowPrompts(opts.yes, globalOpts)) {
+					await interactiveTrashEmptyFlow(manager, parsedKids);
+					return;
+				}
+
 				const deletedCount = await manager.emptyTrash(
 					parsedKids.length > 0 ? parsedKids : undefined,
 				);
@@ -600,11 +916,11 @@ export function buildCliProgram(): Command {
 		.option("-o, --output <file>", "Đường dẫn file đích muốn xuất (ví dụ: ./jwks.json)")
 		.option("--stdout", "Chỉ in kết quả ra màn hình (stdout) thay vì ghi ra file")
 		.option("--no-passive", "Chỉ xuất các khóa đang 'active', bỏ qua các khóa 'passive'")
-		.option("-f, --format <format>", "Định dạng xuất: json | pem", "json")
+		.option("-f, --format <format>", "Định dạng xuất: json | pem | pub", "json")
 		.option("--keep <kids>", "Danh sách kid muốn giữ lại khi Merge (cách nhau bằng dấu phẩy)")
 		.option("--drop <kids>", "Danh sách kid muốn loại bỏ khi Merge (cách nhau bằng dấu phẩy)")
 		.option("--overwrite", "Ghi đè toàn bộ bằng các khóa từ Store (bỏ khóa cũ chỉ có ở file đích)")
-		.option("-y, --yes", "Bỏ qua bảng hỏi Checkbox tương tác khi Merge")
+		.option("-y, --yes", "Bỏ qua các bước hỏi input & bảng chọn tương tác")
 		.action(
 			async (
 				fileArg: string | undefined,
@@ -621,7 +937,25 @@ export function buildCliProgram(): Command {
 			) => {
 				const globalOpts = program.opts<GlobalCliOpts>();
 				await withManager(globalOpts, async (manager) => {
-					if (opts.format.toLowerCase() === "pem") {
+					const explicitFile = fileArg ?? opts.output;
+
+					if (
+						!opts.stdout &&
+						!opts.keep &&
+						!opts.drop &&
+						!opts.overwrite &&
+						shouldShowPrompts(opts.yes, globalOpts)
+					) {
+						await interactiveExportFlow(manager, {
+							outputFile: explicitFile,
+							includePassive: opts.passive,
+							format: opts.format,
+						});
+						return;
+					}
+
+					const fmt = opts.format.toLowerCase();
+					if (fmt === "pem" || fmt === "pub") {
 						const payload = await manager.exportPublicJwks({
 							includePassive: opts.passive,
 						});
@@ -631,9 +965,8 @@ export function buildCliProgram(): Command {
 							pemBlocks.push(`# KID: ${pubJwk.kid} (${pubJwk.alg})\n${spki.trim()}`);
 						}
 						const formattedOutput = `${pemBlocks.join("\n\n")}\n`;
-						const targetOut = fileArg ?? opts.output;
-						if (targetOut) {
-							const outPath = resolve(process.cwd(), targetOut);
+						if (explicitFile) {
+							const outPath = resolve(process.cwd(), explicitFile);
 							await mkdir(dirname(outPath), { recursive: true });
 							await Bun.write(outPath, formattedOutput);
 							console.log(
@@ -649,25 +982,8 @@ export function buildCliProgram(): Command {
 					const storeAbs = resolve(manager.adapter.location);
 					const defaultTtyFile = cwdJwks === storeAbs ? undefined : "./jwks.json";
 					const targetFile =
-						fileArg ??
-						opts.output ??
+						explicitFile ??
 						(!opts.stdout && !globalOpts.json && process.stdin.isTTY ? defaultTtyFile : undefined);
-
-					if (
-						!opts.stdout &&
-						!globalOpts.json &&
-						!opts.yes &&
-						!opts.keep &&
-						!opts.drop &&
-						!opts.overwrite &&
-						process.stdin.isTTY
-					) {
-						await interactiveExportFlow(manager, {
-							outputFile: targetFile,
-							includePassive: opts.passive,
-						});
-						return;
-					}
 
 					if (targetFile) {
 						const outPath = resolve(process.cwd(), targetFile);
@@ -738,39 +1054,60 @@ export function buildCliProgram(): Command {
 
 	// 12. Lệnh import
 	program
-		.command("import <file>")
+		.command("import [file]")
 		.description("Nhập khóa có sẵn từ file Private Key (.pem PKCS#8) hoặc file JWK (.json)")
 		.option("-a, --alg <alg>", "Thuật toán của khóa (bắt buộc nếu import từ file .pem)")
 		.option("--kid <id>", "Mã định danh khóa (kid) tùy chỉnh")
 		.option("--status <status>", "Trạng thái khóa (active | passive)", "active")
-		.action(async (filePath: string, opts: { alg?: string; kid?: string; status: string }) => {
-			const globalOpts = program.opts<GlobalCliOpts>();
-			await withManager(globalOpts, async (manager, ctx) => {
-				await manager.initStore();
-				const file = Bun.file(resolve(filePath));
-				if (!(await file.exists())) {
-					throw new Error(`Không tìm thấy file cần import tại: ${filePath}`);
-				}
-				const rawContent = await file.text();
-				const { record, diff } = await manager.importKey({
-					rawContent,
-					alg: opts.alg as SigningAlgorithm | undefined,
-					kid: opts.kid,
-					status: opts.status as KeyStatus,
-					passphrase: ctx.passphrase,
-				});
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác")
+		.action(
+			async (
+				filePath: string | undefined,
+				opts: { alg?: string; kid?: string; status: string; yes?: boolean },
+			) => {
+				const globalOpts = program.opts<GlobalCliOpts>();
+				await withManager(globalOpts, async (manager, ctx) => {
+					if (shouldShowPrompts(opts.yes, globalOpts)) {
+						await interactiveImportFlow(manager, {
+							filePath,
+							alg: opts.alg as SigningAlgorithm | undefined,
+							kid: opts.kid,
+							status: opts.status as KeyStatus,
+							passphrase: ctx.passphrase,
+						});
+						return;
+					}
 
-				if (globalOpts.json) {
-					console.log(JSON.stringify({ record, diff }, null, 2));
-				} else {
-					console.log(
-						`${pc.green("✓")} Đã import thành công khóa: ${pc.bold(pc.cyan(record.kid))} (${record.alg})`,
-					);
-					console.log(`  Đã lưu Private Key (.pem) tại: ${pc.bold(record.privateKeyPath)}`);
-					console.log(renderMutationDiff(diff));
-				}
-			});
-		});
+					if (!filePath) {
+						throw new Error("Vui lòng truyền đường dẫn <file> cần import khi dùng cờ -y.");
+					}
+
+					await manager.initStore();
+					const file = Bun.file(resolve(filePath));
+					if (!(await file.exists())) {
+						throw new Error(`Không tìm thấy file cần import tại: ${filePath}`);
+					}
+					const rawContent = await file.text();
+					const { record, diff } = await manager.importKey({
+						rawContent,
+						alg: opts.alg as SigningAlgorithm | undefined,
+						kid: opts.kid,
+						status: opts.status as KeyStatus,
+						passphrase: ctx.passphrase,
+					});
+
+					if (globalOpts.json) {
+						console.log(JSON.stringify({ record, diff }, null, 2));
+					} else {
+						console.log(
+							`${pc.green("✓")} Đã import thành công khóa: ${pc.bold(pc.cyan(record.kid))} (${record.alg})`,
+						);
+						console.log(`  Đã lưu Private Key (.pem) tại: ${pc.bold(record.privateKeyPath)}`);
+						console.log(renderMutationDiff(diff));
+					}
+				});
+			},
+		);
 
 	// 13. Lệnh sign
 	program
@@ -782,6 +1119,7 @@ export function buildCliProgram(): Command {
 		.option("--iss <issuer>", "Trường iss (Issuer)")
 		.option("--sub <subject>", "Trường sub (Subject)")
 		.option("--aud <audience>", "Trường aud (Audience)")
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác, ký ngay với giá trị mặc định")
 		.action(
 			async (opts: {
 				data: string;
@@ -790,9 +1128,23 @@ export function buildCliProgram(): Command {
 				iss?: string;
 				sub?: string;
 				aud?: string;
+				yes?: boolean;
 			}) => {
 				const globalOpts = program.opts<GlobalCliOpts>();
 				await withManager(globalOpts, async (manager, ctx) => {
+					if (shouldShowPrompts(opts.yes, globalOpts)) {
+						await interactiveSignFlow(manager, {
+							data: opts.data,
+							kid: opts.kid,
+							expiresIn: opts.expiresIn,
+							iss: opts.iss,
+							sub: opts.sub,
+							aud: opts.aud,
+							passphrase: ctx.passphrase,
+						});
+						return;
+					}
+
 					const payload = JSON.parse(opts.data) as Record<string, unknown>;
 					const { token, usedKey } = await manager.signJwt({
 						payload,
@@ -815,42 +1167,88 @@ export function buildCliProgram(): Command {
 
 	// 14. Lệnh verify
 	program
-		.command("verify <token>")
+		.command("verify [token]")
 		.description("Xác thực thử một JWT bằng bộ Public JWK trong Store")
 		.option("--kid <id>", "Chỉ định kid cụ thể để verify")
 		.option("--allow-expired-key", "Cho phép verify cả bằng khóa đã revoked hoặc hết hạn ân hạn")
-		.action(async (token: string, opts: { kid?: string; allowExpiredKey?: boolean }) => {
-			const globalOpts = program.opts<GlobalCliOpts>();
-			await withManager(globalOpts, async (manager) => {
-				const result = await manager.verifyJwt(token, {
-					kid: opts.kid,
-					allowRevokedOrExpiredKey: Boolean(opts.allowExpiredKey),
-				});
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác")
+		.action(
+			async (
+				token: string | undefined,
+				opts: { kid?: string; allowExpiredKey?: boolean; yes?: boolean },
+			) => {
+				const globalOpts = program.opts<GlobalCliOpts>();
+				await withManager(globalOpts, async (manager) => {
+					if (shouldShowPrompts(opts.yes, globalOpts)) {
+						await interactiveVerifyFlow(manager, {
+							token,
+							kid: opts.kid,
+							allowExpiredKey: opts.allowExpiredKey,
+						});
+						return;
+					}
 
-				if (globalOpts.json) {
-					console.log(JSON.stringify(result, null, 2));
-				} else {
-					console.log(
-						`${pc.green("✓ JWT Hợp lệ!")} Xác thực bởi khóa: ${pc.bold(pc.cyan(result.matchedKey.kid))} (${result.matchedKey.alg}, status=${result.matchedKey.status})`,
-					);
-					console.log(pc.bold("Header:"), JSON.stringify(result.protectedHeader));
-					console.log(pc.bold("Payload:"), JSON.stringify(result.payload, null, 2));
-				}
-			});
-		});
+					if (!token) {
+						throw new Error("Vui lòng truyền chuỗi <token> cần verify khi dùng cờ -y.");
+					}
+
+					const result = await manager.verifyJwt(token, {
+						kid: opts.kid,
+						allowRevokedOrExpiredKey: Boolean(opts.allowExpiredKey),
+					});
+
+					if (globalOpts.json) {
+						console.log(JSON.stringify(result, null, 2));
+					} else {
+						console.log(
+							`${pc.green("✓ JWT Hợp lệ!")} Xác thực bởi khóa: ${pc.bold(pc.cyan(result.matchedKey.kid))} (${result.matchedKey.alg}, status=${result.matchedKey.status})`,
+						);
+						console.log(pc.bold("Header:"), JSON.stringify(result.protectedHeader));
+						console.log(pc.bold("Payload:"), JSON.stringify(result.payload, null, 2));
+					}
+				});
+			},
+		);
 
 	// 15. Lệnh sync
 	program
 		.command("sync")
 		.description("Đồng bộ danh sách khóa từ Store hiện tại sang một Store hoặc Profile đích")
-		.requiredOption("--to <target>", "Tên Profile đích hoặc đường dẫn/URI của Store đích")
-		.action(async (opts: { to: string }) => {
+		.option("--to <target>", "Tên Profile đích hoặc đường dẫn/URI của Store đích")
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác")
+		.action(async (opts: { to?: string; yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
 			await withManager(globalOpts, async (manager) => {
+				let targetUriOrProfile = opts.to ?? "./jwks-backup.json";
+
+				if (shouldShowPrompts(opts.yes, globalOpts)) {
+					const enteredTo = await text({
+						message:
+							"Nhập tên Profile đích hoặc đường dẫn/URI của Store đích cần đồng bộ tới (gõ 'back' để hủy):",
+						initialValue: targetUriOrProfile,
+						defaultValue: targetUriOrProfile,
+						placeholder: targetUriOrProfile,
+					});
+					if (isCancel(enteredTo) || String(enteredTo).trim().toLowerCase() === "back") {
+						return;
+					}
+					targetUriOrProfile = String(enteredTo || targetUriOrProfile).trim();
+
+					const ok = await confirm({
+						message: `Xác nhận đồng bộ danh sách khóa từ ${manager.adapter.location} → ${targetUriOrProfile}?`,
+						initialValue: true,
+					});
+					if (isCancel(ok) || !ok) {
+						return;
+					}
+				} else if (!opts.to) {
+					throw new Error("Vui lòng truyền --to <target> khi chạy sync với cờ -y.");
+				}
+
 				const cfg = await loadConfigFile(globalOpts.config);
-				const targetProfile = cfg?.profiles?.[opts.to] ?? {
-					type: detectStoreType(opts.to),
-					uri: opts.to,
+				const targetProfile = cfg?.profiles?.[targetUriOrProfile] ?? {
+					type: detectStoreType(targetUriOrProfile),
+					uri: targetUriOrProfile,
 					tableName: globalOpts.tableName ?? "jwks_keys",
 				};
 
@@ -886,8 +1284,36 @@ export function buildCliProgram(): Command {
 		.description("Mở nhanh HTTP Server phục vụ /.well-known/jwks.json trực tiếp từ Store")
 		.option("--port <number>", "Cổng lắng nghe HTTP", "8080")
 		.option("--host <host>", "Địa chỉ host lắng nghe", "127.0.0.1")
-		.action(async (opts: { port: string; host: string }) => {
+		.option("-y, --yes", "Bỏ qua các bước hỏi input tương tác, chạy server ngay với cổng mặc định")
+		.action(async (opts: { port: string; host: string; yes?: boolean }) => {
 			const globalOpts = program.opts<GlobalCliOpts>();
+			let host = opts.host ?? "127.0.0.1";
+			let port = opts.port ?? "8080";
+
+			if (shouldShowPrompts(opts.yes, globalOpts)) {
+				const enteredHost = await text({
+					message: "Địa chỉ Host lắng nghe HTTP (Enter dùng mặc định, gõ 'back' để hủy):",
+					initialValue: host,
+					defaultValue: host,
+					placeholder: host,
+				});
+				if (isCancel(enteredHost) || String(enteredHost).trim().toLowerCase() === "back") {
+					return;
+				}
+				host = String(enteredHost || host).trim();
+
+				const enteredPort = await text({
+					message: "Cổng HTTP (Port) [Enter dùng mặc định, gõ 'back' để hủy]:",
+					initialValue: port,
+					defaultValue: port,
+					placeholder: port,
+				});
+				if (isCancel(enteredPort) || String(enteredPort).trim().toLowerCase() === "back") {
+					return;
+				}
+				port = String(enteredPort || port).trim();
+			}
+
 			const ctx = await resolveRuntimeContext(globalOpts);
 			const adapter = createStorageAdapter(ctx.profile);
 			const vault = new PemVault(ctx.profile.keysDir);
@@ -895,8 +1321,8 @@ export function buildCliProgram(): Command {
 			await manager.initStore();
 
 			const server = Bun.serve({
-				hostname: opts.host,
-				port: Number(opts.port),
+				hostname: host,
+				port: Number(port),
 				async fetch(req) {
 					const url = new URL(req.url);
 					if (

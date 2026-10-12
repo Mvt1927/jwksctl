@@ -61,6 +61,9 @@ export interface GenerateKeyOptions {
 	passphrase?: string;
 	status?: KeyStatus;
 	expiresIn?: string;
+	outputPem?: string;
+	/** Nếu truyền path, ghi Public Key ra file: .pem → SPKI PEM, .json → JWK JSON */
+	outputPublic?: string;
 }
 
 export interface RotateKeyOptions {
@@ -70,6 +73,9 @@ export interface RotateKeyOptions {
 	gracePeriod?: string;
 	revokeOldImmediately?: boolean;
 	passphrase?: string;
+	outputPem?: string;
+	/** Nếu truyền path, ghi Public Key ra file: .pem → SPKI PEM, .json → JWK JSON */
+	outputPublic?: string;
 }
 
 export interface InspectKeyResult {
@@ -105,6 +111,76 @@ export interface ExportMergePlan {
 	candidates: ExportMergeCandidate[];
 }
 
+/**
+ * Ghi Public Key ra file:
+ * - Nếu targetPath kết thúc bằng `.json` → JWK JSON
+ * - Nếu targetPath kết thúc bằng `.pub` hoặc `.pem` → SPKI PEM tại path đó
+ * - Nếu targetPath là thư mục hoặc rỗng/mặc định → lưu file `<kid>.pub` trong thư mục đó (hoặc cùng thư mục với private key)
+ * Trả về đường dẫn tuyệt đối đã ghi.
+ */
+async function savePublicKeyFile(
+	record: JwkRecord,
+	targetPath: string,
+	privateKeyPath?: string,
+): Promise<string> {
+	const { mkdir, stat } = await import("node:fs/promises");
+	const { dirname, resolve, isAbsolute, join, basename } = await import("node:path");
+
+	let resolvedTarget = targetPath.trim();
+	// Nếu user nhập "true" hoặc "yes" hoặc ".", suy luận path
+	if (resolvedTarget === "true" || resolvedTarget === "yes" || resolvedTarget === ".") {
+		if (privateKeyPath) {
+			const privDir = dirname(resolve(process.cwd(), privateKeyPath));
+			const privBase = basename(privateKeyPath, ".pem");
+			resolvedTarget = join(privDir, `${privBase}.pub`);
+		} else {
+			resolvedTarget = join(process.cwd(), `${record.kid}.pub`);
+		}
+	}
+
+	let absPath = isAbsolute(resolvedTarget)
+		? resolvedTarget
+		: resolve(process.cwd(), resolvedTarget);
+
+	// Kiểm tra nếu absPath là thư mục (hoặc kết thúc bằng / hay \)
+	const isDir =
+		resolvedTarget.endsWith("/") ||
+		resolvedTarget.endsWith("\\") ||
+		(await stat(absPath)
+			.then((s) => s.isDirectory())
+			.catch(() => false));
+
+	if (isDir) {
+		absPath = join(absPath, `${record.kid}.pub`);
+	} else if (
+		!absPath.toLowerCase().endsWith(".pub") &&
+		!absPath.toLowerCase().endsWith(".pem") &&
+		!absPath.toLowerCase().endsWith(".json")
+	) {
+		// Không có extension pub/pem/json -> mặc định đuôi .pub
+		absPath = `${absPath}.pub`;
+	}
+
+	await mkdir(dirname(absPath), { recursive: true });
+
+	if (absPath.toLowerCase().endsWith(".json")) {
+		const raw = record as unknown as Record<string, unknown>;
+		const { kty, use, key_ops, alg, kid, n, e, crv, x, y } = raw;
+		const pubJwk = Object.fromEntries(
+			Object.entries({ kty, use, key_ops, alg, kid, n, e, crv, x, y }).filter(
+				([, v]) => v !== undefined,
+			),
+		);
+		const content = JSON.stringify({ keys: [pubJwk] }, null, 2) + "\n";
+		await Bun.write(absPath, content);
+	} else {
+		const spkiPem = await exportPublicJwkToPem(record);
+		const content = `# Public Key for KID: ${record.kid} (${record.alg})\n${spkiPem.trim()}\n`;
+		await Bun.write(absPath, content);
+	}
+	return absPath;
+}
+
 export class KeyManagerService {
 	constructor(
 		public readonly adapter: IStorageAdapter,
@@ -124,6 +200,7 @@ export class KeyManagerService {
 	async generateKey(options: GenerateKeyOptions = {}): Promise<{
 		record: JwkRecord;
 		diff: MutationDiff;
+		publicFilePath?: string;
 	}> {
 		const alg = options.alg ?? "RS256";
 		const material = await generateKeyMaterial({
@@ -132,10 +209,13 @@ export class KeyManagerService {
 			modulusLength: options.modulusLength,
 		});
 
+		const publicPem = await exportPublicJwkToPem(material.publicJwk);
 		const savedPem = await this.vault.savePrivateKey(
 			material.kid,
 			material.privateKeyPem,
 			options.passphrase,
+			options.outputPem,
+			publicPem,
 		);
 
 		const now = new Date();
@@ -155,7 +235,15 @@ export class KeyManagerService {
 
 		try {
 			const diff = await this.adapter.addKeys([record]);
-			return { record, diff };
+			let publicFilePath: string | undefined;
+			if (options.outputPublic) {
+				publicFilePath = await savePublicKeyFile(
+					record,
+					options.outputPublic,
+					record.privateKeyPath,
+				);
+			}
+			return { record, diff, publicFilePath };
 		} catch (err) {
 			// Nếu ghi vào Store thất bại (ví dụ trùng kid), dọn dẹp file .pem vừa tạo
 			await this.vault.deletePrivateKey(savedPem.privateKeyPath);
@@ -182,6 +270,7 @@ export class KeyManagerService {
 		newRecord: JwkRecord;
 		demotedKids: string[];
 		diff: MutationDiff;
+		publicFilePath?: string;
 	}> {
 		const existing = await this.adapter.listKeys();
 		const currentActive = existing.filter((k) => k.status === "active");
@@ -199,10 +288,13 @@ export class KeyManagerService {
 			modulusLength: options.modulusLength,
 		});
 
+		const publicPem = await exportPublicJwkToPem(material.publicJwk);
 		const savedPem = await this.vault.savePrivateKey(
 			material.kid,
 			material.privateKeyPem,
 			options.passphrase,
+			options.outputPem,
+			publicPem,
 		);
 
 		const newActiveRecord: JwkRecord = {
@@ -224,15 +316,85 @@ export class KeyManagerService {
 
 		try {
 			const diff = await this.adapter.rotateAtomic(updatedOldRecords, newActiveRecord);
+			let publicFilePath: string | undefined;
+			if (options.outputPublic) {
+				publicFilePath = await savePublicKeyFile(
+					newActiveRecord,
+					options.outputPublic,
+					newActiveRecord.privateKeyPath,
+				);
+			}
 			return {
 				newRecord: newActiveRecord,
 				demotedKids: updatedOldRecords.map((k) => k.kid),
 				diff,
+				publicFilePath,
 			};
 		} catch (err) {
 			await this.vault.deletePrivateKey(savedPem.privateKeyPath);
 			throw err;
 		}
+	}
+
+	/**
+	 * Chỉnh sửa thông tin một khóa trong Store (đổi kid kèm tên file .pem, đổi trạng thái status, đặt/xóa hạn dùng expiresAt).
+	 */
+	async editKey(
+		kid: string,
+		updates: {
+			newKid?: string;
+			status?: KeyStatus;
+			expiresIn?: string;
+			clearExpiry?: boolean;
+		},
+	): Promise<{ record: JwkRecord; diff: MutationDiff }> {
+		const existing = await this.adapter.getKey(kid);
+		if (!existing) {
+			throw new Error(`Không tìm thấy khóa có kid "${kid}" trong Store.`);
+		}
+
+		const targetKid = updates.newKid?.trim() ? updates.newKid.trim() : existing.kid;
+		const targetStatus = updates.status ?? existing.status;
+		let targetExpiresAt = existing.expiresAt;
+
+		if (updates.clearExpiry) {
+			targetExpiresAt = null;
+		} else if (updates.expiresIn) {
+			targetExpiresAt = new Date(Date.now() + parseDurationMs(updates.expiresIn)).toISOString();
+		}
+
+		if (targetKid === existing.kid) {
+			const updatedRecord: JwkRecord = {
+				...existing,
+				status: targetStatus,
+				expiresAt: targetExpiresAt,
+			};
+			const diff = await this.adapter.updateKeys([updatedRecord]);
+			return { record: updatedRecord, diff };
+		}
+
+		if (await this.adapter.getKey(targetKid)) {
+			throw new Error(`Mã định danh kid mới "${targetKid}" đã tồn tại trong Store.`);
+		}
+
+		const newPemPath = await this.vault.renamePrivateKey(existing.privateKeyPath, targetKid);
+		const renamedRecord: JwkRecord = {
+			...existing,
+			kid: targetKid,
+			status: targetStatus,
+			expiresAt: targetExpiresAt,
+			privateKeyPath: newPemPath,
+		};
+
+		const before = await this.adapter.listKeys();
+		await this.adapter.addKeys([renamedRecord]);
+		await this.adapter.removeKeys([existing.kid], { force: true });
+		const after = await this.adapter.listKeys();
+
+		return {
+			record: renamedRecord,
+			diff: SafeMutationGuard.computeDiff(before, after),
+		};
 	}
 
 	async previewRemoveKeys(

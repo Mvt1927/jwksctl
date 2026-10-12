@@ -121,6 +121,17 @@ export async function generateKeyMaterial(
 }
 
 /**
+ * Tự động trích xuất block PKCS#8 (PRIVATE KEY hoặc ENCRYPTED PRIVATE KEY)
+ * ngay cả khi file .pem chứa cả block PUBLIC KEY hoặc các chú thích khác.
+ */
+export function extractPkcs8PemBlock(pemContent: string): string {
+	const match = pemContent.match(
+		/-----BEGIN (?:ENCRYPTED )?PRIVATE KEY-----[\s\S]*?-----END (?:ENCRYPTED )?PRIVATE KEY-----/,
+	);
+	return match ? match[0] : pemContent;
+}
+
+/**
  * Nhập khóa từ chuỗi PKCS#8 Private Key PEM và trích xuất ra Public JWK + PKCS#8 PEM chuẩn.
  */
 export async function extractPublicJwkFromPrivatePem(
@@ -128,7 +139,8 @@ export async function extractPublicJwkFromPrivatePem(
 	alg: SigningAlgorithm,
 	customKid?: string,
 ): Promise<GeneratedKeyMaterial> {
-	const privateCryptoKey = await importPKCS8(pkcs8Pem, alg, { extractable: true });
+	const cleanPkcs8 = extractPkcs8PemBlock(pkcs8Pem);
+	const privateCryptoKey = await importPKCS8(cleanPkcs8, alg, { extractable: true });
 	const exportedJwk = await exportJWK(privateCryptoKey);
 	const normalizedPrivatePem = await exportPKCS8(privateCryptoKey);
 
@@ -215,7 +227,8 @@ export async function signJwtWithPem(options: {
 	audience?: string;
 	subject?: string;
 }): Promise<string> {
-	const privateKey = await importPKCS8(options.privateKeyPem, options.alg);
+	const cleanPkcs8 = extractPkcs8PemBlock(options.privateKeyPem);
+	const privateKey = await importPKCS8(cleanPkcs8, options.alg);
 	const signer = new SignJWT(options.payload)
 		.setProtectedHeader({ alg: options.alg, kid: options.kid, typ: "JWT" })
 		.setIssuedAt();
