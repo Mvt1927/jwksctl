@@ -2,6 +2,8 @@ import { resolve } from "node:path";
 import type { JwksCtlConfig, StoreProfile, StoreType } from "../core/types.ts";
 import type { IStorageAdapter } from "../storage/adapter.ts";
 import { JsonFileAdapter } from "../storage/file-adapter.ts";
+import { MongoAdapter } from "../storage/mongo-adapter.ts";
+import { SqlAdapter } from "../storage/sql-adapter.ts";
 import { SqliteAdapter } from "../storage/sqlite-adapter.ts";
 
 export const DEFAULT_CONFIG_FILE = ".jwksctl.json";
@@ -106,11 +108,11 @@ export function createStorageAdapter(profile: StoreProfile): IStorageAdapter {
 		case "sqlite":
 			return new SqliteAdapter(profile.uri, tableName);
 		case "postgres":
+			return new SqlAdapter(profile.uri, "postgres", tableName);
 		case "mysql":
+			return new SqlAdapter(profile.uri, "mysql", tableName);
 		case "mongodb":
-			throw new Error(
-				`Adapter "${type}" sẽ được kích hoạt trong Giai đoạn 3. Hiện tại hỗ trợ ưu tiên "file" (jwks.json) và "sqlite".`,
-			);
+			return new MongoAdapter(profile.uri, tableName);
 		default:
 			throw new Error(`Loại Store không xác định: ${String(type)}`);
 	}
