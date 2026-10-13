@@ -1,5 +1,5 @@
-import { mkdir, rename } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { mkdir, rename, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { decodeProtectedHeader, type JWK, type JWTPayload } from "jose";
 import {
 	exportPublicJwkToPem,
@@ -123,9 +123,6 @@ async function savePublicKeyFile(
 	targetPath: string,
 	privateKeyPath?: string,
 ): Promise<string> {
-	const { mkdir, stat } = await import("node:fs/promises");
-	const { dirname, resolve, isAbsolute, join, basename } = await import("node:path");
-
 	let resolvedTarget = targetPath.trim();
 	// Nếu user nhập "true" hoặc "yes" hoặc ".", suy luận path
 	if (resolvedTarget === "true" || resolvedTarget === "yes" || resolvedTarget === ".") {
@@ -164,14 +161,8 @@ async function savePublicKeyFile(
 	await mkdir(dirname(absPath), { recursive: true });
 
 	if (absPath.toLowerCase().endsWith(".json")) {
-		const raw = record as unknown as Record<string, unknown>;
-		const { kty, use, key_ops, alg, kid, n, e, crv, x, y } = raw;
-		const pubJwk = Object.fromEntries(
-			Object.entries({ kty, use, key_ops, alg, kid, n, e, crv, x, y }).filter(
-				([, v]) => v !== undefined,
-			),
-		);
-		const content = JSON.stringify({ keys: [pubJwk] }, null, 2) + "\n";
+		const cleanPub = toCleanPublicJwk(record);
+		const content = JSON.stringify({ keys: [cleanPub] }, null, 2) + "\n";
 		await Bun.write(absPath, content);
 	} else {
 		const spkiPem = await exportPublicJwkToPem(record);
@@ -387,8 +378,13 @@ export class KeyManagerService {
 		};
 
 		const before = await this.adapter.listKeys();
-		await this.adapter.addKeys([renamedRecord]);
-		await this.adapter.removeKeys([existing.kid], { force: true });
+		try {
+			await this.adapter.addKeys([renamedRecord]);
+			await this.adapter.removeKeys([existing.kid], { force: true });
+		} catch (err) {
+			await this.vault.renamePrivateKey(newPemPath, existing.kid).catch(() => {});
+			throw err;
+		}
 		const after = await this.adapter.listKeys();
 
 		return {

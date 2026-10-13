@@ -205,4 +205,64 @@ describe("Phase 1: Core Crypto, SafeMutationGuard, JsonFileAdapter & SqliteAdapt
 
 		await sqliteAdapter.close();
 	});
+
+	test("5. Hardening: Cảnh báo định dạng PKCS#1, Public JWK JSON sạch, và Rollback file .pem khi editKey thất bại", async () => {
+		const jwksPath = join(tempDir, "jwks.json");
+		const keysDir = join(tempDir, "keys");
+		const pubJsonPath = join(tempDir, "exported-pub.json");
+		const adapter = new JsonFileAdapter(jwksPath);
+		const vault = new PemVault(keysDir);
+		const manager = new KeyManagerService(adapter, vault);
+
+		await manager.initStore();
+
+		// 1. Kiểm tra phát hiện PKCS#1 / SEC1
+		const fakePkcs1 =
+			"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
+		await expect(
+			manager.importKey({
+				rawContent: fakePkcs1,
+				alg: "RS256",
+			}),
+		).rejects.toThrow("Phát hiện Private Key ở định dạng truyền thống (PKCS#1/SEC1)");
+
+		// 2. Tạo key kèm outputPublic file .json -> đảm bảo không có trường nội bộ
+		const { record } = await manager.generateKey({
+			alg: "EdDSA",
+			kid: "eddsa-hardening-1",
+			outputPublic: pubJsonPath,
+		});
+
+		const pubJsonContent = JSON.parse(await Bun.file(pubJsonPath).text()) as {
+			keys: Array<Record<string, unknown>>;
+		};
+		expect(pubJsonContent.keys.length).toBe(1);
+		const pubJwk = pubJsonContent.keys[0]!;
+		expect(pubJwk.kid).toBe("eddsa-hardening-1");
+		expect(pubJwk.kty).toBe("OKP");
+		expect(pubJwk.crv).toBe("Ed25519");
+		expect(pubJwk.status).toBeUndefined();
+		expect(pubJwk.privateKeyPath).toBeUndefined();
+
+		// 3. Rollback editKey: Giả lập lỗi khi lưu vào adapter
+		const originalPemPath = record.privateKeyPath;
+		expect(await vault.exists(originalPemPath)).toBe(true);
+
+		// Làm hỏng adapter để ném lỗi khi addKeys
+		const originalAddKeys = adapter.addKeys.bind(adapter);
+		adapter.addKeys = async () => {
+			throw new Error("Mô phỏng lỗi DB mạng khi addKeys");
+		};
+
+		await expect(manager.editKey("eddsa-hardening-1", { newKid: "eddsa-new-kid" })).rejects.toThrow(
+			"Mô phỏng lỗi DB mạng khi addKeys",
+		);
+
+		// Sau lỗi, file pem cũ phải được rollback về lại kid cũ
+		expect(await vault.exists(originalPemPath)).toBe(true);
+		expect(await vault.exists(vault.getKeyFilePath("eddsa-new-kid"))).toBe(false);
+
+		// Phục hồi lại hàm addKeys
+		adapter.addKeys = originalAddKeys;
+	});
 });

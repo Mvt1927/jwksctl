@@ -125,6 +125,14 @@ export async function generateKeyMaterial(
  * ngay cả khi file .pem chứa cả block PUBLIC KEY hoặc các chú thích khác.
  */
 export function extractPkcs8PemBlock(pemContent: string): string {
+	if (
+		pemContent.includes("-----BEGIN RSA PRIVATE KEY-----") ||
+		pemContent.includes("-----BEGIN EC PRIVATE KEY-----")
+	) {
+		throw new Error(
+			"Phát hiện Private Key ở định dạng truyền thống (PKCS#1/SEC1). jwksctl yêu cầu chuẩn PKCS#8. Vui lòng chuyển đổi bằng lệnh: openssl pkcs8 -topk8 -nocrypt -in <input.pem> -out <output.pem>",
+		);
+	}
 	const match = pemContent.match(
 		/-----BEGIN (?:ENCRYPTED )?PRIVATE KEY-----[\s\S]*?-----END (?:ENCRYPTED )?PRIVATE KEY-----/,
 	);

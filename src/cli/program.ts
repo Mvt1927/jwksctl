@@ -1346,6 +1346,20 @@ export function buildCliProgram(): Command {
 				},
 			});
 
+			const shutdown = async () => {
+				console.log(pc.dim("\n  Đang dừng JWKS Server và giải phóng kết nối..."));
+				server.stop(true);
+				await adapter.close?.();
+				process.exit(0);
+			};
+
+			process.once("SIGINT", () => {
+				void shutdown();
+			});
+			process.once("SIGTERM", () => {
+				void shutdown();
+			});
+
 			console.log(
 				`${pc.green("●")} JWKS Server đang chạy tại: ${pc.bold(pc.cyan(`http://${server.hostname}:${server.port}/.well-known/jwks.json`))}`,
 			);
